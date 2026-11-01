@@ -1,56 +1,124 @@
 package basicbankingapp;
 
+import java.io.Console;
 import java.math.BigDecimal;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Scanner;
 
-/** Console menu. All banking rules live in {@link BankAccount}. */
+/** Console menus. All banking rules live in {@link Bank} and {@link BankAccount}. */
 public class BasicBankingApp {
 
+    private final Bank bank;
+    private final Scanner scanner;
+
     public static void main(String[] args) {
-        BankAccount account = new BankAccount("Strawberry", "JX11004");
-        new BasicBankingApp().run(account, new Scanner(System.in));
+        new BasicBankingApp(new Bank(), new Scanner(System.in)).run();
     }
 
-    void run(BankAccount account, Scanner scanner) {
-        System.out.println("Welcome, " + account.getCustomerName());
-        System.out.println("Your ID is: " + account.getCustomerId());
-        printMenu();
+    BasicBankingApp(Bank bank, Scanner scanner) {
+        this.bank = bank;
+        this.scanner = scanner;
+    }
 
+    void run() {
+        System.out.println("Welcome to Basic Banking App");
         char option;
         do {
-            System.out.print("\nEnter an option: ");
-            String line = scanner.hasNextLine() ? scanner.nextLine().trim() : "E";
-            option = line.isEmpty() ? ' ' : Character.toUpperCase(line.charAt(0));
-
+            printStartMenu();
+            option = readOption('E');
             switch (option) {
-                case 'A' -> System.out.println("Balance: " + account.getBalance());
-                case 'B' -> handleDeposit(account, scanner);
-                case 'C' -> handleWithdrawal(account, scanner);
-                case 'D' -> showPrevious(account);
-                case 'F' -> showHistory(account);
-                case 'E' -> System.out.println("Thank you for using our services. Goodbye!");
-                default -> {
-                    System.out.println("Invalid option, please try again.");
-                    printMenu();
+                case 'R' -> register();
+                case 'L' -> {
+                    User user = login();
+                    if (user != null) {
+                        runSession(user);
+                    }
                 }
+                case 'E' -> System.out.println("Thank you for using our services. Goodbye!");
+                default -> System.out.println("Invalid option, please try again.");
             }
         } while (option != 'E');
     }
 
-    private void printMenu() {
+    // ---------- start menu ----------
+
+    private void printStartMenu() {
+        System.out.println("""
+
+            R. Register
+            L. Log in
+            E. Exit""");
+    }
+
+    private void register() {
+        String username = readLine("Choose a username: ");
+        String fullName = readLine("Full name: ");
+        char[] password = readPassword("Choose a password (8+ characters, letters and numbers): ");
+        char[] confirm = readPassword("Confirm password: ");
+        boolean matches = Arrays.equals(password, confirm);
+        Arrays.fill(confirm, '\0');
+        if (!matches) {
+            Arrays.fill(password, '\0');
+            System.out.println("Registration failed: passwords do not match");
+            return;
+        }
+        try {
+            User user = bank.register(username, fullName, password);
+            System.out.println("Registered. Your account number is " + user.getAccount().getCustomerId());
+        } catch (RegistrationException e) {
+            System.out.println("Registration failed: " + e.getMessage());
+        }
+    }
+
+    private User login() {
+        String username = readLine("Username: ");
+        char[] password = readPassword("Password: ");
+        try {
+            return bank.login(username, password);
+        } catch (AuthenticationException e) {
+            System.out.println("Login failed: " + e.getMessage());
+            return null;
+        }
+    }
+
+    // ---------- signed-in menu ----------
+
+    private void runSession(User user) {
+        BankAccount account = user.getAccount();
+        System.out.println("\nSigned in as " + user.getFullName());
+        System.out.println("Account number: " + account.getCustomerId());
+        char option;
+        do {
+            printAccountMenu();
+            option = readOption('O');
+            switch (option) {
+                case 'A' -> System.out.println("Balance: " + account.getBalance());
+                case 'B' -> deposit(account);
+                case 'C' -> withdraw(account);
+                case 'T' -> transfer(account);
+                case 'D' -> showPrevious(account);
+                case 'F' -> showHistory(account);
+                case 'O' -> System.out.println("Signed out.");
+                default -> System.out.println("Invalid option, please try again.");
+            }
+        } while (option != 'O');
+    }
+
+    private void printAccountMenu() {
         System.out.println("""
 
             A. Check balance
             B. Deposit
             C. Withdraw
+            T. Transfer to another account
             D. Previous transaction
             F. Full transaction history
-            E. Exit""");
+            O. Sign out""");
     }
 
-    private void handleDeposit(BankAccount account, Scanner scanner) {
-        BigDecimal amount = readAmount("Enter an amount to deposit: ", scanner);
+    private void deposit(BankAccount account) {
+        BigDecimal amount = readAmount("Enter an amount to deposit: ");
         if (amount == null) {
             return;
         }
@@ -62,8 +130,8 @@ public class BasicBankingApp {
         }
     }
 
-    private void handleWithdrawal(BankAccount account, Scanner scanner) {
-        BigDecimal amount = readAmount("Enter an amount to withdraw: ", scanner);
+    private void withdraw(BankAccount account) {
+        BigDecimal amount = readAmount("Enter an amount to withdraw: ");
         if (amount == null) {
             return;
         }
@@ -72,6 +140,21 @@ public class BasicBankingApp {
             System.out.println("Withdrawn: " + amount + ". New balance: " + account.getBalance());
         } catch (InsufficientFundsException | IllegalArgumentException e) {
             System.out.println("Withdrawal failed: " + e.getMessage());
+        }
+    }
+
+    private void transfer(BankAccount account) {
+        String toAccount = readLine("Recipient account number: ");
+        BigDecimal amount = readAmount("Enter an amount to transfer: ");
+        if (amount == null) {
+            return;
+        }
+        try {
+            bank.transfer(account.getCustomerId(), toAccount, amount);
+            System.out.println("Transferred: " + amount + " to " + toAccount
+                + ". New balance: " + account.getBalance());
+        } catch (InsufficientFundsException | IllegalArgumentException e) {
+            System.out.println("Transfer failed: " + e.getMessage());
         }
     }
 
@@ -90,10 +173,37 @@ public class BasicBankingApp {
         history.forEach(System.out::println);
     }
 
-    /** Returns null (after printing a message) when the input is not a number. */
-    private BigDecimal readAmount(String prompt, Scanner scanner) {
+    // ---------- input helpers ----------
+
+    /** Returns {@code atEndOfInput} when there is no more input, so a closed stream cannot loop forever. */
+    private char readOption(char atEndOfInput) {
+        System.out.print("\nEnter an option: ");
+        if (!scanner.hasNextLine()) {
+            return atEndOfInput;
+        }
+        String line = scanner.nextLine().trim();
+        return line.isEmpty() ? ' ' : Character.toUpperCase(line.charAt(0));
+    }
+
+    private String readLine(String prompt) {
         System.out.print(prompt);
-        String text = scanner.hasNextLine() ? scanner.nextLine().trim() : "";
+        return scanner.hasNextLine() ? scanner.nextLine().trim() : "";
+    }
+
+    /** Hides typing when run in a real terminal; IDE run windows have no console, so it falls back to a visible prompt. */
+    private char[] readPassword(String prompt) {
+        Console console = System.console();
+        if (console != null) {
+            char[] password = console.readPassword("%s", prompt);
+            return password == null ? new char[0] : password;
+        }
+        System.out.print(prompt);
+        return (scanner.hasNextLine() ? scanner.nextLine() : "").toCharArray();
+    }
+
+    /** Returns null (after printing a message) when the input is not a number. */
+    private BigDecimal readAmount(String prompt) {
+        String text = readLine(prompt);
         try {
             return new BigDecimal(text);
         } catch (NumberFormatException e) {
