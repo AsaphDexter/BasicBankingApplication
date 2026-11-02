@@ -2,6 +2,7 @@ package basicbankingapp;
 
 import java.io.Console;
 import java.math.BigDecimal;
+import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Scanner;
@@ -12,8 +13,17 @@ public class BasicBankingApp {
     private final Bank bank;
     private final Scanner scanner;
 
+    /** Saves to {@code data/bank} by default. Pass {@code --memory} for a throwaway demo that forgets everything. */
     public static void main(String[] args) {
-        new BasicBankingApp(new Bank(), new Scanner(System.in)).run();
+        boolean memoryOnly = args.length > 0 && args[0].equals("--memory");
+        try (BankRepository repository = memoryOnly
+                 ? new InMemoryBankRepository()
+                 : JdbcBankRepository.file(Path.of("data", "bank"))) {
+            System.out.println(memoryOnly
+                ? "Demo mode: nothing will be saved."
+                : "Data is saved in the data folder.");
+            new BasicBankingApp(new Bank(new PasswordHasher(), repository), new Scanner(System.in)).run();
+        }
     }
 
     BasicBankingApp(Bank bank, Scanner scanner) {
@@ -85,20 +95,20 @@ public class BasicBankingApp {
     // ---------- signed-in menu ----------
 
     private void runSession(User user) {
-        BankAccount account = user.getAccount();
+        String accountNumber = user.getAccount().getCustomerId();
         System.out.println("\nSigned in as " + user.getFullName());
-        System.out.println("Account number: " + account.getCustomerId());
+        System.out.println("Account number: " + accountNumber);
         char option;
         do {
             printAccountMenu();
             option = readOption('O');
             switch (option) {
-                case 'A' -> System.out.println("Balance: " + account.getBalance());
-                case 'B' -> deposit(account);
-                case 'C' -> withdraw(account);
-                case 'T' -> transfer(account);
-                case 'D' -> showPrevious(account);
-                case 'F' -> showHistory(account);
+                case 'A' -> System.out.println("Balance: " + balanceOf(accountNumber));
+                case 'B' -> deposit(accountNumber);
+                case 'C' -> withdraw(accountNumber);
+                case 'T' -> transfer(accountNumber);
+                case 'D' -> showPrevious(accountNumber);
+                case 'F' -> showHistory(accountNumber);
                 case 'O' -> System.out.println("Signed out.");
                 default -> System.out.println("Invalid option, please try again.");
             }
@@ -117,60 +127,64 @@ public class BasicBankingApp {
             O. Sign out""");
     }
 
-    private void deposit(BankAccount account) {
+    private void deposit(String accountNumber) {
         BigDecimal amount = readAmount("Enter an amount to deposit: ");
         if (amount == null) {
             return;
         }
         try {
-            account.deposit(amount);
-            System.out.println("Deposited: " + amount + ". New balance: " + account.getBalance());
+            bank.deposit(accountNumber, amount);
+            System.out.println("Deposited: " + amount + ". New balance: " + balanceOf(accountNumber));
         } catch (IllegalArgumentException e) {
             System.out.println("Deposit failed: " + e.getMessage());
         }
     }
 
-    private void withdraw(BankAccount account) {
+    private void withdraw(String accountNumber) {
         BigDecimal amount = readAmount("Enter an amount to withdraw: ");
         if (amount == null) {
             return;
         }
         try {
-            account.withdraw(amount);
-            System.out.println("Withdrawn: " + amount + ". New balance: " + account.getBalance());
+            bank.withdraw(accountNumber, amount);
+            System.out.println("Withdrawn: " + amount + ". New balance: " + balanceOf(accountNumber));
         } catch (InsufficientFundsException | IllegalArgumentException e) {
             System.out.println("Withdrawal failed: " + e.getMessage());
         }
     }
 
-    private void transfer(BankAccount account) {
+    private void transfer(String accountNumber) {
         String toAccount = readLine("Recipient account number: ");
         BigDecimal amount = readAmount("Enter an amount to transfer: ");
         if (amount == null) {
             return;
         }
         try {
-            bank.transfer(account.getCustomerId(), toAccount, amount);
+            bank.transfer(accountNumber, toAccount, amount);
             System.out.println("Transferred: " + amount + " to " + toAccount
-                + ". New balance: " + account.getBalance());
+                + ". New balance: " + balanceOf(accountNumber));
         } catch (InsufficientFundsException | IllegalArgumentException e) {
             System.out.println("Transfer failed: " + e.getMessage());
         }
     }
 
-    private void showPrevious(BankAccount account) {
-        System.out.println(account.getPreviousTransaction()
+    private void showPrevious(String accountNumber) {
+        System.out.println(bank.findAccount(accountNumber).getPreviousTransaction()
             .map(Transaction::toString)
             .orElse("No transactions yet."));
     }
 
-    private void showHistory(BankAccount account) {
-        List<Transaction> history = account.getHistory();
+    private void showHistory(String accountNumber) {
+        List<Transaction> history = bank.findAccount(accountNumber).getHistory();
         if (history.isEmpty()) {
             System.out.println("No transactions yet.");
             return;
         }
         history.forEach(System.out::println);
+    }
+
+    private BigDecimal balanceOf(String accountNumber) {
+        return bank.findAccount(accountNumber).getBalance();
     }
 
     // ---------- input helpers ----------

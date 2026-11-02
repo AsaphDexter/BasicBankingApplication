@@ -3,6 +3,7 @@ package basicbankingapp;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.LocalDateTime;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -28,6 +29,15 @@ public class BankAccount {
         }
         this.customerName = customerName;
         this.customerId = customerId;
+    }
+
+    /** Rebuilds an account from saved data. Used by the storage layer. */
+    static BankAccount restore(String customerName, String customerId, BigDecimal balance,
+                               List<Transaction> history) {
+        BankAccount account = new BankAccount(customerName, customerId);
+        account.balance = balance.setScale(2, RoundingMode.UNNECESSARY);
+        account.history.addAll(history);
+        return account;
     }
 
     public void deposit(BigDecimal amount) {
@@ -99,6 +109,6 @@ public class BankAccount {
     }
 
     private void record(Transaction.Type type, BigDecimal amount, String counterparty) {
-        history.add(new Transaction(type, amount, balance, LocalDateTime.now(), counterparty));
+        history.add(new Transaction(type, amount, balance, LocalDateTime.now().truncatedTo(ChronoUnit.MICROS), counterparty));
     }
 }

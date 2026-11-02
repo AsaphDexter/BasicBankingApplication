@@ -5,17 +5,25 @@ import static org.junit.jupiter.api.Assertions.*;
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
 import java.util.Scanner;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
-/** End-to-end checks of the console menus using scripted input. */
+/** End-to-end checks of the console menus using scripted input and a real (in-memory) H2 database. */
 class BasicBankingAppTest {
 
+    private BankRepository repository;
     private Bank bank;
 
     @BeforeEach
     void setUp() {
-        bank = new Bank(new PasswordHasher(1_000));
+        repository = JdbcBankRepository.inMemory();
+        bank = new Bank(new PasswordHasher(1_000), repository);
+    }
+
+    @AfterEach
+    void tearDown() {
+        repository.close();
     }
 
     /** Runs the app with the given lines as keyboard input and returns everything it printed. */
@@ -58,7 +66,7 @@ class BasicBankingAppTest {
             "O",
             "E");
         assertTrue(output.contains("Transferred: 30"));
-        assertEquals(new java.math.BigDecimal("30.00"), bob.getAccount().getBalance());
+        assertEquals(new java.math.BigDecimal("30.00"), bank.findAccount(bob.getAccount().getCustomerId()).getBalance());
         assertEquals(new java.math.BigDecimal("70.00"), bank.getUser("alice").getAccount().getBalance());
     }
 
@@ -112,5 +120,21 @@ class BasicBankingAppTest {
     void endOfInputExitsInsteadOfLoopingForever() {
         String output = run("L", "alice", "Passw0rd1");
         assertTrue(output.contains("Goodbye!"));
+    }
+
+    @Test
+    void historyOptionListsEveryMovementInOrder() {
+        String output = run(
+            "R", "alice", "Alice Doe", "Passw0rd1", "Passw0rd1",
+            "L", "alice", "Passw0rd1",
+            "B", "100",
+            "C", "30",
+            "F",
+            "O",
+            "E");
+        int deposit = output.indexOf("Deposited 100.00");
+        int withdrawal = output.indexOf("Withdrawn 30.00");
+        assertTrue(deposit >= 0);
+        assertTrue(withdrawal > deposit);
     }
 }

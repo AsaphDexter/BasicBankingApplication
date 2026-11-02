@@ -2,13 +2,12 @@ package basicbankingapp;
 
 import java.math.BigDecimal;
 import java.util.Arrays;
-import java.util.HashMap;
-import java.util.Map;
 import java.util.regex.Pattern;
 
 /**
- * Users, sign-in and transfers. Everything is held in memory for now;
- * a database comes in the next stage. Not thread-safe.
+ * The rules for users, sign-in, deposits, withdrawals and transfers.
+ * Storage is behind {@link BankRepository}, and every money movement runs as one
+ * all-or-nothing transaction. Not thread-safe.
  */
 public class Bank {
 
@@ -17,17 +16,17 @@ public class Bank {
     private static final String BAD_LOGIN = "Invalid username or password";
 
     private final PasswordHasher hasher;
+    private final BankRepository repository;
     private final String dummyHash;
-    private final Map<String, User> usersByUsername = new HashMap<>();
-    private final Map<String, BankAccount> accountsById = new HashMap<>();
-    private long nextAccountNumber = 1_000_000_001L;
 
+    /** In-memory bank with the default (strong) password hashing. */
     public Bank() {
-        this(new PasswordHasher());
+        this(new PasswordHasher(), new InMemoryBankRepository());
     }
 
-    public Bank(PasswordHasher hasher) {
+    public Bank(PasswordHasher hasher, BankRepository repository) {
         this.hasher = hasher;
+        this.repository = repository;
         // Checked against when the username does not exist, so a login for an unknown user
         // takes about as long as a real one and gives nothing away.
         this.dummyHash = hasher.hash("not-a-real-password".toCharArray());
@@ -45,14 +44,18 @@ public class Bank {
                 throw new RegistrationException("Full name is required");
             }
             checkPasswordStrength(key, password);
-            if (usersByUsername.containsKey(key)) {
-                throw new RegistrationException("That username is already taken");
-            }
-            BankAccount account = new BankAccount(fullName.trim(), newAccountNumber());
-            User user = new User(key, fullName.trim(), hasher.hash(password), account);
-            usersByUsername.put(key, user);
-            accountsById.put(account.getCustomerId(), account);
-            return user;
+            String name = fullName.trim();
+            String passwordHash = hasher.hash(password);
+
+            return repository.inTransaction(() -> {
+                if (repository.usernameExists(key)) {
+                    throw new RegistrationException("That username is already taken");
+                }
+                BankAccount account = new BankAccount(name, repository.nextAccountNumber());
+                User user = new User(key, name, passwordHash, account);
+                repository.insertUser(user);
+                return user;
+            });
         } finally {
             wipe(password);
         }
@@ -65,7 +68,8 @@ public class Bank {
      */
     public User login(String username, char[] password) {
         try {
-            User user = usersByUsername.get(normalize(username));
+            String key = normalize(username);
+            User user = key == null ? null : repository.findUser(key).orElse(null);
             if (user == null) {
                 hasher.verify(password, dummyHash);
                 throw new AuthenticationException(BAD_LOGIN);
@@ -74,12 +78,19 @@ public class Bank {
                 throw new AccountLockedException("This account is locked after too many failed attempts");
             }
             if (hasher.verify(password, user.getPasswordHash())) {
-                user.resetFailedLogins();
+                if (user.getFailedLogins() > 0) {
+                    user.resetFailedLogins();
+                    repository.saveLoginState(user);
+                }
                 return user;
             }
             user.recordFailedLogin();
-            if (user.getFailedLogins() >= MAX_FAILED_LOGINS) {
+            boolean nowLocked = user.getFailedLogins() >= MAX_FAILED_LOGINS;
+            if (nowLocked) {
                 user.lock();
+            }
+            repository.saveLoginState(user);
+            if (nowLocked) {
                 throw new AccountLockedException("Too many failed attempts. This account is now locked");
             }
             throw new AuthenticationException(BAD_LOGIN);
@@ -90,41 +101,69 @@ public class Bank {
 
     /** For a future admin feature: lets a locked user sign in again. */
     public void unlock(String username) {
-        User user = usersByUsername.get(normalize(username));
+        String key = normalize(username);
+        User user = key == null ? null : repository.findUser(key).orElse(null);
         if (user == null) {
             throw new IllegalArgumentException("Unknown user");
         }
         user.unlock();
+        repository.saveLoginState(user);
     }
 
+    /** A snapshot of the user as stored right now, or null. */
     public User getUser(String username) {
-        return usersByUsername.get(normalize(username));
+        String key = normalize(username);
+        return key == null ? null : repository.findUser(key).orElse(null);
     }
 
+    /** A snapshot of the account as stored right now, or null. */
     public BankAccount findAccount(String accountNumber) {
-        return accountsById.get(accountNumber);
+        return repository.findAccount(accountNumber).orElse(null);
+    }
+
+    public void deposit(String accountNumber, BigDecimal amount) {
+        repository.runInTransaction(() -> {
+            BankAccount account = requireAccount(accountNumber);
+            account.deposit(amount);
+            save(account);
+        });
+    }
+
+    public void withdraw(String accountNumber, BigDecimal amount) {
+        repository.runInTransaction(() -> {
+            BankAccount account = requireAccount(accountNumber);
+            account.withdraw(amount);
+            save(account);
+        });
     }
 
     /**
-     * Moves money between two accounts. Everything is checked before anything changes,
-     * so a failed transfer leaves both balances as they were.
+     * Moves money between two accounts as one all-or-nothing transaction:
+     * if anything fails, neither balance changes.
      */
     public void transfer(String fromAccountNumber, String toAccountNumber, BigDecimal amount) {
-        BankAccount from = requireAccount(fromAccountNumber);
-        BankAccount to = requireAccount(toAccountNumber);
-        if (from == to) {
-            throw new IllegalArgumentException("You cannot transfer to the same account");
-        }
-        from.sendTransfer(amount, to.getCustomerId()); // validates amount and funds first
-        to.receiveTransfer(amount, from.getCustomerId());
+        repository.runInTransaction(() -> {
+            BankAccount from = requireAccount(fromAccountNumber);
+            BankAccount to = requireAccount(toAccountNumber);
+            if (from.getCustomerId().equals(to.getCustomerId())) {
+                throw new IllegalArgumentException("You cannot transfer to the same account");
+            }
+            from.sendTransfer(amount, to.getCustomerId()); // validates amount and funds first
+            to.receiveTransfer(amount, from.getCustomerId());
+            save(from);
+            save(to);
+        });
+    }
+
+    /** Stores the newest transaction of an account that was just changed. */
+    private void save(BankAccount account) {
+        Transaction latest = account.getPreviousTransaction().orElseThrow();
+        repository.applyChange(account.getCustomerId(), latest);
     }
 
     private BankAccount requireAccount(String accountNumber) {
-        BankAccount account = accountsById.get(accountNumber);
-        if (account == null) {
-            throw new IllegalArgumentException("No account found with number " + accountNumber);
-        }
-        return account;
+        return repository.findAccount(accountNumber).orElseThrow(
+            () -> new IllegalArgumentException("No account found with number " + accountNumber));
     }
 
     private void checkPasswordStrength(String username, char[] password) {
@@ -143,10 +182,6 @@ public class Bank {
         if (new String(password).equalsIgnoreCase(username)) {
             throw new RegistrationException("Password cannot be the same as the username");
         }
-    }
-
-    private String newAccountNumber() {
-        return String.valueOf(nextAccountNumber++);
     }
 
     private static String normalize(String username) {

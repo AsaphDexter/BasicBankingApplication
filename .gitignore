@@ -4,3 +4,8 @@ target/
 *.iml
 .vscode/
 nbproject/private/
+
+# local database files
+data/
+*.mv.db
+*.trace.db

@@ -11,10 +11,18 @@ public final class User {
     private boolean locked;
 
     User(String username, String fullName, String passwordHash, BankAccount account) {
+        this(username, fullName, passwordHash, account, 0, false);
+    }
+
+    /** Used by the storage layer to rebuild a saved user. */
+    User(String username, String fullName, String passwordHash, BankAccount account,
+         int failedLogins, boolean locked) {
         this.username = username;
         this.fullName = fullName;
         this.passwordHash = passwordHash;
         this.account = account;
+        this.failedLogins = failedLogins;
+        this.locked = locked;
     }
 
     public String getUsername() {

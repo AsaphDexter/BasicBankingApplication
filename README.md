@@ -2,7 +2,7 @@
 
 [![Build and test](https://github.com/AsaphDexter/BasicBankingApplication/actions/workflows/build.yml/badge.svg)](https://github.com/AsaphDexter/BasicBankingApplication/actions/workflows/build.yml)
 
-A console banking app in Java with multiple users, sign-in and transfers. The banking and security rules are kept separate from the menus so they can be unit tested.
+A console banking app in Java with multiple users, secure sign-in, transfers and a real SQL database (H2, through JDBC). The banking rules are kept separate from both the menus and the storage, so each part can be tested on its own.
 
 ## Features
 
@@ -13,53 +13,69 @@ A console banking app in Java with multiple users, sign-in and transfers. The ba
   - wrong username and wrong password give the same message
   - an account locks after 3 failed logins in a row
 - **Each user has an account** with a generated account number
-- **Deposit, withdraw, check balance**, with validation:
-  - amounts must be greater than zero, with at most 2 decimal places
-  - a withdrawal cannot exceed the balance (`InsufficientFundsException`)
-- **Transfer money to another user's account** by account number; a failed transfer changes neither balance
+- **Deposit, withdraw, check balance**, with validation (amount above zero, at most 2 decimal places, no overdraft)
+- **Transfer money to another user's account**; a transfer is all-or-nothing, so a failure leaves both balances unchanged
 - **Transaction history** (type, amount, other account, balance after, timestamp)
+- **Data is saved** in an embedded H2 database and is still there after the app restarts
 
 ## Design
 
 | Class | Responsibility |
 |---|---|
-| `Bank` | Registration, login, lockout, account lookup and transfers |
-| `User` | Username, name, password hash, account, failed-login state |
+| `Bank` | The rules: registration, login, lockout, deposits, withdrawals, transfers |
+| `BankRepository` | Interface for storage (the `Bank` only talks to this) |
+| `JdbcBankRepository` | H2 database through JDBC: prepared statements, transactions, constraints |
+| `InMemoryBankRepository` | Same interface, kept in memory (used for `--memory` demos and tests) |
+| `User`, `BankAccount`, `Transaction` | The domain objects |
 | `PasswordHasher` | Salted PBKDF2 hashing and constant-time verification (JDK only) |
-| `BankAccount` | Balance, deposit/withdraw rules and history. No console I/O |
-| `Transaction` | Immutable record of one money movement |
 | `BasicBankingApp` | Console menus and input handling only |
-| `*Exception` classes | `InsufficientFundsException`, `RegistrationException`, `AuthenticationException`, `AccountLockedException` |
 
-Money uses `BigDecimal`, not `int` or `double`, to avoid rounding errors.
+### Database
+
+Tables `users`, `accounts` and `transactions`, created automatically on first run. The database enforces key rules itself, even if the Java checks were bypassed:
+
+- usernames are unique
+- an account balance can never be negative
+- a transaction must belong to a real account
+- every query uses a `PreparedStatement`, so SQL injection is not possible
+- money movements run inside a database transaction, so a crash or error halfway rolls everything back
+
+Money uses `BigDecimal` / `DECIMAL(19,2)`, never floating point.
 
 ## Run it
 
 Requires Java 17+ and Maven.
 
 ```bash
-mvn -B verify          # build and run the tests
-java -cp target/classes basicbankingapp.BasicBankingApp
+mvn -B verify      # build and run all tests
 ```
 
-Run it from a real terminal to hide your password as you type. In an IDE run window the password is visible.
+To start the app, run `BasicBankingApp.main` from IntelliJ (green play icon), or from a terminal:
+
+```bash
+mvn -q compile exec:java -Dexec.mainClass=basicbankingapp.BasicBankingApp
+```
+
+Data is saved in the `data/` folder next to where you run it (ignored by Git). For a throwaway demo that forgets everything, add `-Dexec.args="--memory"`.
+
+Run it from a real terminal to hide your password as you type; an IDE run window shows it.
 
 ## Tests
 
-JUnit 5 tests in `src/test/java/basicbankingapp/` cover:
+JUnit 5, about 97 tests. The same bank tests run against both storage options:
 
-- `BankAccountTest`: deposits, withdrawals, overdraft, bad amounts, history
-- `PasswordHasherTest`: hashing, salting, wrong passwords, malformed stored values
-- `BankTest`: registration rules, login, lockout and unlock, transfers (including failures and total money staying constant)
-- `BasicBankingAppTest`: end-to-end menu flows with scripted input
+- `AbstractBankTest`, run by `InMemoryBankTest` and `JdbcBankTest`: registration, login, lockout, deposits, withdrawals, transfers, history
+- `JdbcBankTest` also checks what only a database can do: data survives a restart, a failed transfer is rolled back completely, the database refuses negative balances, duplicate usernames and orphan transactions, passwords are stored only as hashes, and SQL-injection-style input is treated as plain text
+- `BankAccountTest`, `PasswordHasherTest`, `BasicBankingAppTest` (end-to-end menu flows with scripted input)
 
 GitHub Actions runs them on every push.
 
 ## Limitations
 
-This is a learning project. Data is kept in memory and lost when the app exits, and it is not thread-safe. A real bank also needs audit logs, session handling, multi-factor authentication and regulated security controls.
+This is a learning project, not a real bank. The database file is not encrypted, only one app instance can use it at a time, and it has no audit log, session handling or multi-factor authentication. Real banking software needs all of those plus regulated security controls.
 
 ## Next steps
 
-- Store users and transactions in a database (the in-memory storage will move behind a repository interface)
 - Admin unlock for locked users
+- Move to a server database such as PostgreSQL (only a new `BankRepository` is needed)
+- A REST API with the same test suite around it
