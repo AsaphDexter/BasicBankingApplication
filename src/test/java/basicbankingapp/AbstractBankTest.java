@@ -81,7 +81,7 @@ abstract class AbstractBankTest {
     @Test
     void duplicateUsernameIsRejectedIgnoringCase() {
         register("alice");
-        assertThrows(RegistrationException.class, () -> bank.register("ALICE", "Other Person", pw("Passw0rd1")));
+        assertThrows(UsernameTakenException.class, () -> bank.register("ALICE", "Other Person", pw("Passw0rd1")));
     }
 
     @Test
@@ -249,7 +249,7 @@ abstract class AbstractBankTest {
 
     @Test
     void depositToAnUnknownAccountIsRejected() {
-        assertThrows(IllegalArgumentException.class, () -> bank.deposit("9999999999", money("5")));
+        assertThrows(AccountNotFoundException.class, () -> bank.deposit("9999999999", money("5")));
         assertThrows(IllegalArgumentException.class, () -> bank.withdraw("9999999999", money("5")));
     }
 

@@ -109,4 +109,31 @@ class BankAccountTest {
         assertThrows(IllegalArgumentException.class, () -> new BankAccount(" ", "X1"));
         assertThrows(IllegalArgumentException.class, () -> new BankAccount("Ann", ""));
     }
+
+    @Test
+    void amountAboveTheMaximumIsRejected() {
+        assertThrows(IllegalArgumentException.class,
+            () -> account.deposit(BankAccount.MAX_AMOUNT.add(new BigDecimal("0.01"))));
+        account.deposit(BankAccount.MAX_AMOUNT); // exactly the maximum is fine
+    }
+
+    @Test
+    void absurdlyLargeExponentIsRejectedQuicklyWithoutExhaustingMemory() {
+        assertThrows(IllegalArgumentException.class, () -> account.deposit(new BigDecimal("1E+999999999")));
+        assertThrows(IllegalArgumentException.class, () -> account.withdraw(new BigDecimal("1E+999999999")));
+        assertTrue(account.getHistory().isEmpty());
+    }
+
+    @Test
+    void balanceCannotGrowPastTheLimit() {
+        BigDecimal almostFull = BankAccount.MAX_BALANCE.subtract(BigDecimal.ONE);
+        for (BigDecimal left = almostFull; left.signum() > 0; ) {
+            BigDecimal chunk = left.min(BankAccount.MAX_AMOUNT);
+            account.deposit(chunk);
+            left = left.subtract(chunk);
+        }
+        assertThrows(IllegalArgumentException.class, () -> account.deposit(new BigDecimal("1.01")));
+        account.deposit(BigDecimal.ONE); // reaching the limit exactly is allowed
+        assertEquals(0, account.getBalance().compareTo(BankAccount.MAX_BALANCE));
+    }
 }

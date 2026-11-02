@@ -145,7 +145,7 @@ public final class JdbcBankRepository implements BankRepository {
                 insertAccount.executeUpdate();
             } catch (SQLException e) {
                 if (UNIQUE_VIOLATION.equals(e.getSQLState())) {
-                    throw new RegistrationException("That username is already taken");
+                    throw new UsernameTakenException();
                 }
                 throw new RepositoryException("Could not save the new user", e);
             }

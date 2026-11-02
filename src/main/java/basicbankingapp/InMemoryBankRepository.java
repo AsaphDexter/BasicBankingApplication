@@ -27,7 +27,7 @@ public class InMemoryBankRepository implements BankRepository {
     @Override
     public void insertUser(User user) {
         if (usersByUsername.containsKey(user.getUsername())) {
-            throw new RegistrationException("That username is already taken");
+            throw new UsernameTakenException();
         }
         usersByUsername.put(user.getUsername(), user);
         accountsByNumber.put(user.getAccount().getCustomerId(), user.getAccount());

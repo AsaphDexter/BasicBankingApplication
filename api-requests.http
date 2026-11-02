@@ -1,0 +1,82 @@
+### Banking API requests for IntelliJ's built-in HTTP client.
+### Start the API first (run BankingApiApp), then click the green arrow next to a request.
+### Run them top to bottom: login saves the token, and the later requests use it.
+
+### Health check
+GET http://localhost:8080/api/health
+
+### Register alice
+POST http://localhost:8080/api/register
+Content-Type: application/json
+
+{
+  "username": "alice",
+  "fullName": "Alice Doe",
+  "password": "Passw0rd1"
+}
+
+### Register bob (the second account to transfer to)
+POST http://localhost:8080/api/register
+Content-Type: application/json
+
+{
+  "username": "bob",
+  "fullName": "Bob Roe",
+  "password": "Passw0rd1"
+}
+
+### Log in as alice (saves the token for the requests below)
+POST http://localhost:8080/api/login
+Content-Type: application/json
+
+{
+  "username": "alice",
+  "password": "Passw0rd1"
+}
+
+> {%
+    client.global.set("token", response.body.token);
+%}
+
+### My account
+GET http://localhost:8080/api/account
+Authorization: Bearer {{token}}
+
+### Deposit
+POST http://localhost:8080/api/deposit
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "amount": 250.75
+}
+
+### Withdraw
+POST http://localhost:8080/api/withdraw
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "amount": 20
+}
+
+### Transfer to bob (bob's account number is shown when you register him)
+POST http://localhost:8080/api/transfer
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "toAccountNumber": "1000000002",
+  "amount": 50
+}
+
+### Transaction history
+GET http://localhost:8080/api/transactions
+Authorization: Bearer {{token}}
+
+### Log out (the token stops working)
+POST http://localhost:8080/api/logout
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{}

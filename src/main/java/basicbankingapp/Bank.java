@@ -7,7 +7,8 @@ import java.util.regex.Pattern;
 /**
  * The rules for users, sign-in, deposits, withdrawals and transfers.
  * Storage is behind {@link BankRepository}, and every money movement runs as one
- * all-or-nothing transaction. Not thread-safe.
+ * all-or-nothing transaction. Every public method is synchronized, so one Bank can be shared
+ * by several threads (for example the web server's request threads).
  */
 public class Bank {
 
@@ -33,7 +34,7 @@ public class Bank {
     }
 
     /** Registers a user and opens their account. The password array is wiped before returning. */
-    public User register(String username, String fullName, char[] password) {
+    public synchronized User register(String username, String fullName, char[] password) {
         try {
             String key = normalize(username);
             if (key == null || !USERNAME.matcher(key).matches()) {
@@ -49,7 +50,7 @@ public class Bank {
 
             return repository.inTransaction(() -> {
                 if (repository.usernameExists(key)) {
-                    throw new RegistrationException("That username is already taken");
+                    throw new UsernameTakenException();
                 }
                 BankAccount account = new BankAccount(name, repository.nextAccountNumber());
                 User user = new User(key, name, passwordHash, account);
@@ -66,7 +67,7 @@ public class Bank {
      * After {@value #MAX_FAILED_LOGINS} failures in a row the user is locked until {@link #unlock}.
      * The password array is wiped before returning.
      */
-    public User login(String username, char[] password) {
+    public synchronized User login(String username, char[] password) {
         try {
             String key = normalize(username);
             User user = key == null ? null : repository.findUser(key).orElse(null);
@@ -100,7 +101,7 @@ public class Bank {
     }
 
     /** For a future admin feature: lets a locked user sign in again. */
-    public void unlock(String username) {
+    public synchronized void unlock(String username) {
         String key = normalize(username);
         User user = key == null ? null : repository.findUser(key).orElse(null);
         if (user == null) {
@@ -111,17 +112,17 @@ public class Bank {
     }
 
     /** A snapshot of the user as stored right now, or null. */
-    public User getUser(String username) {
+    public synchronized User getUser(String username) {
         String key = normalize(username);
         return key == null ? null : repository.findUser(key).orElse(null);
     }
 
     /** A snapshot of the account as stored right now, or null. */
-    public BankAccount findAccount(String accountNumber) {
+    public synchronized BankAccount findAccount(String accountNumber) {
         return repository.findAccount(accountNumber).orElse(null);
     }
 
-    public void deposit(String accountNumber, BigDecimal amount) {
+    public synchronized void deposit(String accountNumber, BigDecimal amount) {
         repository.runInTransaction(() -> {
             BankAccount account = requireAccount(accountNumber);
             account.deposit(amount);
@@ -129,7 +130,7 @@ public class Bank {
         });
     }
 
-    public void withdraw(String accountNumber, BigDecimal amount) {
+    public synchronized void withdraw(String accountNumber, BigDecimal amount) {
         repository.runInTransaction(() -> {
             BankAccount account = requireAccount(accountNumber);
             account.withdraw(amount);
@@ -141,7 +142,7 @@ public class Bank {
      * Moves money between two accounts as one all-or-nothing transaction:
      * if anything fails, neither balance changes.
      */
-    public void transfer(String fromAccountNumber, String toAccountNumber, BigDecimal amount) {
+    public synchronized void transfer(String fromAccountNumber, String toAccountNumber, BigDecimal amount) {
         repository.runInTransaction(() -> {
             BankAccount from = requireAccount(fromAccountNumber);
             BankAccount to = requireAccount(toAccountNumber);
@@ -163,7 +164,7 @@ public class Bank {
 
     private BankAccount requireAccount(String accountNumber) {
         return repository.findAccount(accountNumber).orElseThrow(
-            () -> new IllegalArgumentException("No account found with number " + accountNumber));
+            () -> new AccountNotFoundException(accountNumber));
     }
 
     private void checkPasswordStrength(String username, char[] password) {

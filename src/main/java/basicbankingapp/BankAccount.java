@@ -15,6 +15,11 @@ import java.util.Optional;
  */
 public class BankAccount {
 
+    /** Largest single deposit, withdrawal or transfer. */
+    public static final BigDecimal MAX_AMOUNT = new BigDecimal("1000000000");
+    /** Largest balance an account may hold. */
+    public static final BigDecimal MAX_BALANCE = new BigDecimal("1000000000000");
+
     private final String customerName;
     private final String customerId;
     private BigDecimal balance = BigDecimal.ZERO.setScale(2);
@@ -81,6 +86,9 @@ public class BankAccount {
 
     private void credit(BigDecimal amount, Transaction.Type type, String counterparty) {
         BigDecimal value = validate(amount);
+        if (balance.add(value).compareTo(MAX_BALANCE) > 0) {
+            throw new IllegalArgumentException("Balance limit exceeded");
+        }
         balance = balance.add(value);
         record(type, value, counterparty);
     }
@@ -101,6 +109,9 @@ public class BankAccount {
         }
         if (amount.signum() <= 0) {
             throw new IllegalArgumentException("Amount must be greater than zero");
+        }
+        if (amount.compareTo(MAX_AMOUNT) > 0) { // checked first so absurd values like 1E+999999999 are cheap to reject
+            throw new IllegalArgumentException("Amount cannot be more than " + MAX_AMOUNT.toPlainString());
         }
         if (amount.stripTrailingZeros().scale() > 2) {
             throw new IllegalArgumentException("Amount cannot have more than 2 decimal places");
