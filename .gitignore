@@ -1,7 +1,11 @@
-node_modules/
-playwright-report/
-test-results/
-perf/results/
-*.log
-.DS_Store
+target/
+*.class
 .idea/
+*.iml
+.vscode/
+nbproject/private/
+
+# local database files
+data/
+*.mv.db
+*.trace.db

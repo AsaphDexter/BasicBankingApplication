@@ -3,6 +3,8 @@ package basicbankingapp;
 import static org.junit.jupiter.api.Assertions.*;
 
 import java.math.BigDecimal;
+import java.time.Duration;
+import java.util.List;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -16,7 +18,10 @@ abstract class AbstractBankTest {
     // A low iteration count keeps the tests fast; the real app uses the much higher default.
     protected static final PasswordHasher FAST_HASHER = new PasswordHasher(1_000);
 
+    protected static final Duration LOCKOUT = Duration.ofMinutes(15);
+
     protected BankRepository repository;
+    protected TestClock clock;
     protected Bank bank;
 
     protected abstract BankRepository createRepository();
@@ -24,7 +29,8 @@ abstract class AbstractBankTest {
     @BeforeEach
     void setUp() {
         repository = createRepository();
-        bank = new Bank(FAST_HASHER, repository);
+        clock = new TestClock();
+        bank = new Bank(FAST_HASHER, repository, clock, LOCKOUT);
     }
 
     @AfterEach
@@ -361,5 +367,262 @@ abstract class AbstractBankTest {
         var types = stored(alice).getHistory().stream().map(Transaction::type).toList();
         assertEquals(java.util.List.of(Transaction.Type.DEPOSIT, Transaction.Type.TRANSFER_OUT,
             Transaction.Type.WITHDRAWAL), types);
+    }
+
+    // ---------- timed lockout ----------
+
+    private void lock(String username) {
+        for (int i = 0; i < Bank.MAX_FAILED_LOGINS; i++) {
+            assertThrows(AuthenticationException.class, () -> bank.login(username, pw("Wrong0000")));
+        }
+    }
+
+    @Test
+    void lockLastsExactlyTheLockoutPeriodAndThenLoginWorksAgain() {
+        register("alice");
+        lock("alice");
+        clock.advance(LOCKOUT.minusSeconds(1));
+        assertThrows(AccountLockedException.class, () -> bank.login("alice", pw("Passw0rd1")));
+        clock.advance(Duration.ofSeconds(1)); // the lock ends exactly at the lockout time
+        assertNotNull(bank.login("alice", pw("Passw0rd1")));
+        assertFalse(bank.getUser("alice").isLocked());
+        assertEquals(0, bank.getUser("alice").getFailedLogins());
+    }
+
+    @Test
+    void lockedErrorSaysHowLongToWait() {
+        register("alice");
+        lock("alice");
+        AccountLockedException blocked =
+            assertThrows(AccountLockedException.class, () -> bank.login("alice", pw("Passw0rd1")));
+        assertEquals(LOCKOUT.toSeconds(), blocked.getRetryAfterSeconds());
+        clock.advance(Duration.ofMinutes(10));
+        AccountLockedException later =
+            assertThrows(AccountLockedException.class, () -> bank.login("alice", pw("Passw0rd1")));
+        assertEquals(300L, later.getRetryAfterSeconds());
+    }
+
+    @Test
+    void theLockingAttemptItselfReportsTheWait() {
+        register("alice");
+        assertThrows(AuthenticationException.class, () -> bank.login("alice", pw("Wrong1111")));
+        assertThrows(AuthenticationException.class, () -> bank.login("alice", pw("Wrong2222")));
+        AccountLockedException locking =
+            assertThrows(AccountLockedException.class, () -> bank.login("alice", pw("Wrong3333")));
+        assertEquals(LOCKOUT.toSeconds(), locking.getRetryAfterSeconds());
+    }
+
+    @Test
+    void afterTheLockExpiresTheUserGetsAFreshSetOfAttempts() {
+        register("alice");
+        lock("alice");
+        clock.advance(LOCKOUT);
+        assertThrows(AuthenticationException.class, () -> bank.login("alice", pw("Wrong1111")));
+        assertThrows(AuthenticationException.class, () -> bank.login("alice", pw("Wrong2222")));
+        assertNotNull(bank.login("alice", pw("Passw0rd1"))); // not locked after only two new failures
+    }
+
+    @Test
+    void wrongPasswordRightAfterExpiryStartsANewCountInsteadOfLockingAtOnce() {
+        register("alice");
+        lock("alice");
+        clock.advance(LOCKOUT);
+        assertThrows(AuthenticationException.class, () -> bank.login("alice", pw("Wrong1111")));
+        assertEquals(1, bank.getUser("alice").getFailedLogins());
+        assertFalse(bank.getUser("alice").isLockedAt(clock.instant()));
+    }
+
+    @Test
+    void lockingAgainAfterExpiryNeedsAFullNewRunOfFailures() {
+        register("alice");
+        lock("alice");
+        clock.advance(LOCKOUT);
+        lock("alice");
+        assertTrue(bank.getUser("alice").isLockedAt(clock.instant()));
+    }
+
+    // ---------- unlock ----------
+
+    @Test
+    void adminUnlockEndsTheLockAtOnce() {
+        register("alice");
+        lock("alice");
+        bank.unlock("alice");
+        assertNotNull(bank.login("alice", pw("Passw0rd1")));
+    }
+
+    @Test
+    void unlockingAnUnknownUserIsRejected() {
+        assertThrows(UserNotFoundException.class, () -> bank.unlock("nobody"));
+        assertThrows(UserNotFoundException.class, () -> bank.unlock(null));
+    }
+
+    // ---------- change password ----------
+
+    @Test
+    void changePasswordReplacesTheOldPassword() {
+        register("alice");
+        bank.changePassword("alice", pw("Passw0rd1"), pw("N3wPassword"), null);
+        assertThrows(AuthenticationException.class, () -> bank.login("alice", pw("Passw0rd1")));
+        assertNotNull(bank.login("alice", pw("N3wPassword")));
+    }
+
+    @Test
+    void wrongCurrentPasswordChangesNothing() {
+        register("alice");
+        assertThrows(AuthenticationException.class,
+            () -> bank.changePassword("alice", pw("Wrong1111"), pw("N3wPassword"), null));
+        assertNotNull(bank.login("alice", pw("Passw0rd1")));
+    }
+
+    @Test
+    void wrongCurrentPasswordCountsTowardsTheLockout() {
+        register("alice");
+        for (int i = 0; i < Bank.MAX_FAILED_LOGINS - 1; i++) {
+            assertThrows(AuthenticationException.class,
+                () -> bank.changePassword("alice", pw("Wrong1111"), pw("N3wPassword"), null));
+        }
+        assertThrows(AccountLockedException.class,
+            () -> bank.changePassword("alice", pw("Wrong1111"), pw("N3wPassword"), null));
+        assertThrows(AccountLockedException.class, () -> bank.login("alice", pw("Passw0rd1")));
+    }
+
+    @Test
+    void lockedUserCannotChangeTheirPasswordEvenWithTheRightOne() {
+        register("alice");
+        lock("alice");
+        assertThrows(AccountLockedException.class,
+            () -> bank.changePassword("alice", pw("Passw0rd1"), pw("N3wPassword"), null));
+    }
+
+    @Test
+    void weakOrUnchangedNewPasswordsAreRejectedAndTheOldOneStillWorks() {
+        register("alice");
+        assertThrows(RegistrationException.class,
+            () -> bank.changePassword("alice", pw("Passw0rd1"), pw("short1"), null));
+        assertThrows(RegistrationException.class,
+            () -> bank.changePassword("alice", pw("Passw0rd1"), pw("onlyletters"), null));
+        assertThrows(RegistrationException.class,
+            () -> bank.changePassword("alice", pw("Passw0rd1"), pw("Passw0rd1"), null)); // same as before
+        assertNotNull(bank.login("alice", pw("Passw0rd1")));
+    }
+
+    @Test
+    void passwordArraysAreWipedAfterAChange() {
+        register("alice");
+        char[] oldPassword = pw("Passw0rd1");
+        char[] newPassword = pw("N3wPassword");
+        bank.changePassword("alice", oldPassword, newPassword, null);
+        for (char c : oldPassword) {
+            assertEquals('\0', c);
+        }
+        for (char c : newPassword) {
+            assertEquals('\0', c);
+        }
+    }
+
+    // ---------- audit log ----------
+
+    private List<AuditEvent.Type> typesFor(String username) {
+        // newest first -> reverse so tests read in the order things happened
+        List<AuditEvent.Type> types = bank.auditLog(username, 100).stream().map(AuditEvent::type)
+            .collect(java.util.stream.Collectors.toList());
+        java.util.Collections.reverse(types);
+        return types;
+    }
+
+    @Test
+    void auditLogRecordsRegistrationAndLoginsInOrder() {
+        register("alice");
+        bank.login("alice", pw("Passw0rd1"), "10.0.0.5");
+        assertThrows(AuthenticationException.class, () -> bank.login("alice", pw("Wrong1111"), "10.0.0.5"));
+        assertEquals(List.of(AuditEvent.Type.REGISTERED, AuditEvent.Type.LOGIN_SUCCESS, AuditEvent.Type.LOGIN_FAILED),
+            typesFor("alice"));
+    }
+
+    @Test
+    void auditLogRecordsLockingBlockingUnlockingAndPasswordChanges() {
+        register("alice");
+        lock("alice");
+        assertThrows(AccountLockedException.class, () -> bank.login("alice", pw("Passw0rd1")));
+        bank.unlock("alice");
+        bank.changePassword("alice", pw("Passw0rd1"), pw("N3wPassword"), null);
+        assertEquals(List.of(
+            AuditEvent.Type.REGISTERED,
+            AuditEvent.Type.LOGIN_FAILED, AuditEvent.Type.LOGIN_FAILED, AuditEvent.Type.LOGIN_FAILED,
+            AuditEvent.Type.ACCOUNT_LOCKED, AuditEvent.Type.LOGIN_BLOCKED,
+            AuditEvent.Type.ACCOUNT_UNLOCKED, AuditEvent.Type.PASSWORD_CHANGED),
+            typesFor("alice"));
+    }
+
+    @Test
+    void failedLoginsAreStillRecordedAfterTheExceptionIsThrown() {
+        register("alice");
+        assertThrows(AuthenticationException.class, () -> bank.login("alice", pw("Wrong1111")));
+        assertEquals(1, bank.getUser("alice").getFailedLogins()); // not rolled back with the exception
+        assertEquals(1L, bank.auditLog("alice", 100).stream()
+            .filter(e -> e.type() == AuditEvent.Type.LOGIN_FAILED).count());
+    }
+
+    @Test
+    void auditLogRecordsTransfersAndUnknownUsers() {
+        User alice = register("alice");
+        User bob = register("bob");
+        bank.deposit(acct(alice), money("100"));
+        bank.transfer(acct(alice), acct(bob), money("25.5"));
+        assertThrows(AuthenticationException.class, () -> bank.login("ghost", pw("Passw0rd1"), "10.0.0.9"));
+
+        var transfer = bank.auditLog(null, 100).stream()
+            .filter(e -> e.type() == AuditEvent.Type.TRANSFER).findFirst().orElseThrow();
+        assertTrue(transfer.detail().contains(acct(alice)));
+        assertTrue(transfer.detail().contains(acct(bob)));
+        assertTrue(transfer.detail().contains("25.50"));
+        assertEquals(1, bank.auditLog("ghost", 10).size());
+        assertTrue(bank.auditLog("ghost", 10).get(0).detail().contains("10.0.0.9"));
+    }
+
+    @Test
+    void transferAuditEntriesCanBeFoundByTheUserWhoMadeThem() {
+        User alice = register("alice");
+        User bob = register("bob");
+        bank.deposit(acct(alice), money("100"));
+        bank.transfer(acct(alice), acct(bob), money("10"), "Alice");
+        bank.transfer(acct(bob), acct(alice), money("3"), "bob");
+        assertEquals(1L, bank.auditLog("alice", 100).stream().filter(e -> e.type() == AuditEvent.Type.TRANSFER).count());
+        assertEquals(1L, bank.auditLog("bob", 100).stream().filter(e -> e.type() == AuditEvent.Type.TRANSFER).count());
+    }
+
+    @Test
+    void auditLogNeverContainsPasswordsOrHashes() {
+        register("alice");
+        assertThrows(AuthenticationException.class, () -> bank.login("alice", pw("SecretGuess99")));
+        bank.changePassword("alice", pw("Passw0rd1"), pw("N3wPassword"), "10.0.0.5");
+        for (AuditEvent event : bank.auditLog(null, 100)) {
+            String text = event.toString();
+            assertFalse(text.contains("Passw0rd1"));
+            assertFalse(text.contains("SecretGuess99"));
+            assertFalse(text.contains("N3wPassword"));
+            assertFalse(text.toLowerCase().contains("pbkdf2"));
+        }
+    }
+
+    @Test
+    void auditTextFromAttackersCannotForgeLogLines() {
+        assertThrows(AuthenticationException.class,
+            () -> bank.login("evil\nLOGIN_SUCCESS admin" + "x".repeat(200), pw("Passw0rd1")));
+        AuditEvent event = bank.auditLog(null, 1).get(0);
+        assertFalse(event.username().contains("\n"));
+        assertTrue(event.username().length() <= 50);
+    }
+
+    @Test
+    void auditLogLimitAndNewestFirstOrderingWork() {
+        register("alice");
+        for (int i = 0; i < 5; i++) {
+            bank.login("alice", pw("Passw0rd1"));
+        }
+        assertEquals(3, bank.auditLog("alice", 3).size());
+        assertEquals(AuditEvent.Type.LOGIN_SUCCESS, bank.auditLog("alice", 3).get(0).type());
+        assertEquals(AuditEvent.Type.REGISTERED, bank.auditLog("alice", 100).get(5).type());
     }
 }

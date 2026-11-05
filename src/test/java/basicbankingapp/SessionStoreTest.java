@@ -2,46 +2,18 @@ package basicbankingapp;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-import java.time.Clock;
 import java.time.Duration;
-import java.time.Instant;
-import java.time.ZoneId;
-import java.time.ZoneOffset;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 class SessionStoreTest {
 
-    /** A clock the test can move forward, so expiry is checked without waiting. */
-    private static final class MutableClock extends Clock {
-        private Instant now = Instant.parse("2026-11-02T10:00:00Z");
-
-        void advance(Duration duration) {
-            now = now.plus(duration);
-        }
-
-        @Override
-        public ZoneId getZone() {
-            return ZoneOffset.UTC;
-        }
-
-        @Override
-        public Clock withZone(ZoneId zone) {
-            return this;
-        }
-
-        @Override
-        public Instant instant() {
-            return now;
-        }
-    }
-
-    private MutableClock clock;
+    private TestClock clock;
     private SessionStore store;
 
     @BeforeEach
     void setUp() {
-        clock = new MutableClock();
+        clock = new TestClock();
         store = new SessionStore(Duration.ofMinutes(30), clock);
     }
 
@@ -106,5 +78,16 @@ class SessionStoreTest {
     void lifetimeMustBePositive() {
         assertThrows(IllegalArgumentException.class, () -> new SessionStore(Duration.ZERO));
         assertThrows(IllegalArgumentException.class, () -> new SessionStore(Duration.ofMinutes(-1)));
+    }
+
+    @Test
+    void revokeAllExceptKeepsOnlyTheNamedSession() {
+        String keep = store.create("alice");
+        String other = store.create("alice");
+        String bobs = store.create("bob");
+        store.revokeAllExcept("alice", keep);
+        assertTrue(store.usernameFor(keep).isPresent());
+        assertTrue(store.usernameFor(other).isEmpty());
+        assertTrue(store.usernameFor(bobs).isPresent()); // other users are untouched
     }
 }

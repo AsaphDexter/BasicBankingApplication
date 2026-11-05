@@ -47,6 +47,9 @@ class ApiServerTest {
         }
     }
 
+    private static final String ADMIN_TOKEN = "test-admin-token-0123456789";
+
+    private final List<ApiServer> extraServers = new ArrayList<>();
     private JdbcBankRepository repository;
     private Bank bank;
     private ApiServer server;
@@ -66,6 +69,7 @@ class ApiServerTest {
 
     @AfterEach
     void tearDown() {
+        extraServers.forEach(ApiServer::close);
         server.close();
         repository.close();
     }
@@ -85,6 +89,43 @@ class ApiServerTest {
             : HttpRequest.BodyPublishers.ofString(body));
         HttpResponse<String> response = client.send(request.build(), HttpResponse.BodyHandlers.ofString());
         return new Reply(response.statusCode(), response);
+    }
+
+    /** A second server over the same bank, with its own throttle and admin settings. Returns its base address. */
+    private String startServer(LoginThrottle throttle, String adminToken) throws Exception {
+        ApiServer extra = new ApiServer(bank, new SessionStore(Duration.ofMinutes(30)), throttle, adminToken,
+            new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+        extra.start();
+        extraServers.add(extra);
+        return "http://127.0.0.1:" + extra.port();
+    }
+
+    private Reply send(String baseUrl, String method, String path, Map<String, String> headers, String body)
+        throws Exception {
+        HttpRequest.Builder request = HttpRequest.newBuilder(URI.create(baseUrl + path));
+        headers.forEach(request::header);
+        request.method(method, body == null
+            ? HttpRequest.BodyPublishers.noBody()
+            : HttpRequest.BodyPublishers.ofString(body));
+        HttpResponse<String> response = client.send(request.build(), HttpResponse.BodyHandlers.ofString());
+        return new Reply(response.statusCode(), response);
+    }
+
+    private Reply adminPost(String baseUrl, String path, String adminToken, String body) throws Exception {
+        Map<String, String> headers = new LinkedHashMap<>();
+        headers.put("Content-Type", "application/json");
+        if (adminToken != null) {
+            headers.put("X-Admin-Token", adminToken);
+        }
+        return send(baseUrl, "POST", path, headers, body);
+    }
+
+    private Reply adminGet(String baseUrl, String path, String adminToken) throws Exception {
+        Map<String, String> headers = new LinkedHashMap<>();
+        if (adminToken != null) {
+            headers.put("X-Admin-Token", adminToken);
+        }
+        return send(baseUrl, "GET", path, headers, null);
     }
 
     private Reply post(String path, String token, String jsonBody) throws Exception {
@@ -472,5 +513,213 @@ class ApiServerTest {
         assertEquals(0, total.compareTo(new BigDecimal("200")));
         assertTrue(balanceOf(alice).signum() >= 0);
         assertTrue(balanceOf(bob).signum() >= 0);
+    }
+
+    // ---------- timed lockout over HTTP ----------
+
+    @Test
+    void lockedResponseCarriesARetryAfterHeader() throws Exception {
+        assertEquals(201, register("alice").status());
+        post("/api/login", null, obj("username", "alice", "password", "Wrong1111"));
+        post("/api/login", null, obj("username", "alice", "password", "Wrong2222"));
+        Reply locking = post("/api/login", null, obj("username", "alice", "password", "Wrong3333"));
+        assertEquals(423, locking.status());
+        assertEquals("900", locking.header("Retry-After"));
+        Reply blocked = post("/api/login", null, obj("username", "alice", "password", "Passw0rd1"));
+        assertEquals(423, blocked.status());
+        assertEquals("900", blocked.header("Retry-After"));
+    }
+
+    // ---------- change password ----------
+
+    private void changePassword(String token, String oldPassword, String newPassword, int expectedStatus) throws Exception {
+        Reply reply = post("/api/password", token, obj("oldPassword", oldPassword, "newPassword", newPassword));
+        assertEquals(expectedStatus, reply.status());
+    }
+
+    @Test
+    void changingThePasswordWorksAndEndsTheOtherSessionsButNotTheCurrentOne() throws Exception {
+        String current = registerAndLogin("alice");
+        String otherDevice = post("/api/login", null, obj("username", "alice", "password", "Passw0rd1"))
+            .json().get("token").asText();
+
+        changePassword(current, "Passw0rd1", "N3wPassword", 204);
+
+        assertEquals(200, get("/api/account", current).status());     // the session that changed it stays signed in
+        assertEquals(401, get("/api/account", otherDevice).status()); // every other session is ended
+        assertEquals(401, post("/api/login", null, obj("username", "alice", "password", "Passw0rd1")).status());
+        assertEquals(200, post("/api/login", null, obj("username", "alice", "password", "N3wPassword")).status());
+    }
+
+    @Test
+    void changingAPasswordNeverTouchesOtherUsersSessions() throws Exception {
+        String alice = registerAndLogin("alice");
+        String bob = registerAndLogin("bob");
+        changePassword(alice, "Passw0rd1", "N3wPassword", 204);
+        assertEquals(200, get("/api/account", bob).status());
+    }
+
+    @Test
+    void wrongCurrentPasswordIs403AndRepeatedGuessesLockTheAccount() throws Exception {
+        String token = registerAndLogin("alice");
+        changePassword(token, "Wrong1111", "N3wPassword", 403);
+        changePassword(token, "Wrong2222", "N3wPassword", 403);
+        Reply locking = post("/api/password", token, obj("oldPassword", "Wrong3333", "newPassword", "N3wPassword"));
+        assertEquals(423, locking.status());
+        assertEquals("900", locking.header("Retry-After"));
+        changePassword(token, "Passw0rd1", "N3wPassword", 423); // even the right password, while locked
+    }
+
+    @Test
+    void weakOrUnchangedNewPasswordsAre400AndNothingChanges() throws Exception {
+        String token = registerAndLogin("alice");
+        changePassword(token, "Passw0rd1", "short1", 400);
+        changePassword(token, "Passw0rd1", "onlyletters", 400);
+        changePassword(token, "Passw0rd1", "Passw0rd1", 400);
+        assertEquals(200, post("/api/login", null, obj("username", "alice", "password", "Passw0rd1")).status());
+    }
+
+    @Test
+    void changePasswordNeedsATokenAndBothFields() throws Exception {
+        String token = registerAndLogin("alice");
+        assertEquals(401, post("/api/password", null, obj("oldPassword", "Passw0rd1", "newPassword", "N3wPassword")).status());
+        assertEquals(400, post("/api/password", token, obj("oldPassword", "Passw0rd1")).status());
+        assertEquals(400, post("/api/password", token, obj("newPassword", "N3wPassword")).status());
+        assertEquals(400, post("/api/password", token, obj("oldPassword", "Passw0rd1", "newPassword", "N3wPassword", "x", 1)).status());
+    }
+
+    // ---------- admin endpoints ----------
+
+    @Test
+    void adminEndpointsDoNotExistWhenNoAdminTokenIsConfigured() throws Exception {
+        assertEquals(404, adminPost(base, "/api/admin/unlock", ADMIN_TOKEN, obj("username", "alice")).status());
+        assertEquals(404, adminGet(base, "/api/admin/audit", ADMIN_TOKEN).status());
+    }
+
+    @Test
+    void adminEndpointsRefuseMissingAndWrongTokens() throws Exception {
+        String admin = startServer(LoginThrottle.disabled(), ADMIN_TOKEN);
+        assertEquals(401, adminPost(admin, "/api/admin/unlock", null, obj("username", "alice")).status());
+        assertEquals(401, adminPost(admin, "/api/admin/unlock", "wrong-token-wrong-token", obj("username", "alice")).status());
+        assertEquals(401, adminGet(admin, "/api/admin/audit", null).status());
+        assertEquals(401, adminGet(admin, "/api/admin/audit", ADMIN_TOKEN + "x").status());
+        // a normal user's login token is not an admin token
+        String userToken = registerAndLogin("alice");
+        assertEquals(401, adminPost(admin, "/api/admin/unlock", userToken, obj("username", "alice")).status());
+    }
+
+    @Test
+    void adminCanUnlockALockedUser() throws Exception {
+        String admin = startServer(LoginThrottle.disabled(), ADMIN_TOKEN);
+        assertEquals(201, register("alice").status());
+        for (String wrong : List.of("Wrong1111", "Wrong2222", "Wrong3333")) {
+            post("/api/login", null, obj("username", "alice", "password", wrong));
+        }
+        assertEquals(423, post("/api/login", null, obj("username", "alice", "password", "Passw0rd1")).status());
+
+        assertEquals(204, adminPost(admin, "/api/admin/unlock", ADMIN_TOKEN, obj("username", "alice")).status());
+        assertEquals(200, post("/api/login", null, obj("username", "alice", "password", "Passw0rd1")).status());
+    }
+
+    @Test
+    void unlockingAnUnknownUserIs404AndAnEmptyRequestIs400() throws Exception {
+        String admin = startServer(LoginThrottle.disabled(), ADMIN_TOKEN);
+        assertEquals(404, adminPost(admin, "/api/admin/unlock", ADMIN_TOKEN, obj("username", "nobody")).status());
+        assertEquals(400, adminPost(admin, "/api/admin/unlock", ADMIN_TOKEN, "{}").status());
+    }
+
+    @Test
+    void adminCanReadTheAuditLogFilterAndLimitIt() throws Exception {
+        String admin = startServer(LoginThrottle.disabled(), ADMIN_TOKEN);
+        String token = registerAndLogin("alice");
+        post("/api/login", null, obj("username", "alice", "password", "Wrong1111"));
+        changePassword(token, "Passw0rd1", "N3wPassword", 204);
+
+        Reply all = adminGet(admin, "/api/admin/audit?username=alice", ADMIN_TOKEN);
+        assertEquals(200, all.status());
+        List<String> types = new ArrayList<>();
+        all.json().forEach(entry -> types.add(entry.get("type").asText()));
+        assertEquals(List.of("PASSWORD_CHANGED", "LOGIN_FAILED", "LOGIN_SUCCESS", "REGISTERED"), types);
+        assertFalse(all.body().contains("Passw0rd1"));
+        assertFalse(all.body().contains("N3wPassword"));
+        assertFalse(all.body().toLowerCase().contains("pbkdf2"));
+        assertFalse(all.json().get(0).get("timestamp").asText().isBlank());
+
+        assertEquals(2, adminGet(admin, "/api/admin/audit?username=alice&limit=2", ADMIN_TOKEN).json().size());
+        assertEquals(0, adminGet(admin, "/api/admin/audit?username=nobody", ADMIN_TOKEN).json().size());
+        assertTrue(adminGet(admin, "/api/admin/audit", ADMIN_TOKEN).json().size() >= 4);
+    }
+
+    @Test
+    void auditLimitMustBeAWholeNumberBetween1And200() throws Exception {
+        String admin = startServer(LoginThrottle.disabled(), ADMIN_TOKEN);
+        for (String bad : List.of("0", "201", "-1", "abc", "1.5", "")) {
+            assertEquals(400, adminGet(admin, "/api/admin/audit?limit=" + bad, ADMIN_TOKEN).status(), bad);
+        }
+        assertEquals(200, adminGet(admin, "/api/admin/audit?limit=200", ADMIN_TOKEN).status());
+    }
+
+    // ---------- login throttling ----------
+
+    @Test
+    void afterTooManyFailedLoginsFromOneClientFurtherLoginsAre429() throws Exception {
+        String throttled = startServer(new LoginThrottle(3, Duration.ofMinutes(5)), null);
+        for (int i = 0; i < 3; i++) {
+            assertEquals(401, send(throttled, "POST", "/api/login", Map.of("Content-Type", "application/json"),
+                obj("username", "ghost" + i, "password", "Wrong1234")).status());
+        }
+        assertEquals(201, register("alice").status());
+        Reply blocked = send(throttled, "POST", "/api/login", Map.of("Content-Type", "application/json"),
+            obj("username", "alice", "password", "Passw0rd1")); // even correct credentials are refused for now
+        assertEquals(429, blocked.status());
+        assertTrue(Integer.parseInt(blocked.header("Retry-After")) > 0);
+        assertTrue(Integer.parseInt(blocked.header("Retry-After")) <= 300);
+    }
+
+    @Test
+    void aSuccessfulLoginDoesNotResetTheThrottleCount() throws Exception {
+        String throttled = startServer(new LoginThrottle(3, Duration.ofMinutes(5)), null);
+        assertEquals(201, register("alice").status());
+        Map<String, String> json = Map.of("Content-Type", "application/json");
+        assertEquals(401, send(throttled, "POST", "/api/login", json, obj("username", "ghost1", "password", "Wrong1234")).status());
+        assertEquals(200, send(throttled, "POST", "/api/login", json, obj("username", "alice", "password", "Passw0rd1")).status());
+        assertEquals(401, send(throttled, "POST", "/api/login", json, obj("username", "ghost2", "password", "Wrong1234")).status());
+        assertEquals(200, send(throttled, "POST", "/api/login", json, obj("username", "alice", "password", "Passw0rd1")).status());
+        assertEquals(401, send(throttled, "POST", "/api/login", json, obj("username", "ghost3", "password", "Wrong1234")).status());
+        assertEquals(429, send(throttled, "POST", "/api/login", json, obj("username", "alice", "password", "Passw0rd1")).status());
+    }
+
+    @Test
+    void wrongAdminTokensAndWrongOldPasswordsAlsoCountTowardsTheThrottle() throws Exception {
+        String throttled = startServer(new LoginThrottle(3, Duration.ofMinutes(5)), ADMIN_TOKEN);
+        String token = send(throttled, "POST", "/api/register", Map.of("Content-Type", "application/json"),
+            obj("username", "alice", "fullName", "Alice", "password", "Passw0rd1")).status() == 201
+            ? send(throttled, "POST", "/api/login", Map.of("Content-Type", "application/json"),
+                obj("username", "alice", "password", "Passw0rd1")).json().get("token").asText() : "";
+        assertFalse(token.isEmpty());
+
+        assertEquals(401, adminPost(throttled, "/api/admin/unlock", "guess-guess-guess-1", obj("username", "alice")).status());
+        assertEquals(401, adminGet(throttled, "/api/admin/audit", "guess-guess-guess-2").status());
+        Map<String, String> auth = new LinkedHashMap<>();
+        auth.put("Content-Type", "application/json");
+        auth.put("Authorization", "Bearer " + token);
+        assertEquals(403, send(throttled, "POST", "/api/password", auth,
+            obj("oldPassword", "Wrong1111", "newPassword", "N3wPassword")).status());
+        // three failures from this client: the next attempt of any of these kinds is refused
+        assertEquals(429, adminGet(throttled, "/api/admin/audit", ADMIN_TOKEN).status());
+        assertEquals(429, send(throttled, "POST", "/api/password", auth,
+            obj("oldPassword", "Passw0rd1", "newPassword", "N3wPassword")).status());
+    }
+
+    @Test
+    void theThrottleIsPerClientAddressAndLeavesAnUnthrottledServerAlone() throws Exception {
+        String throttled = startServer(new LoginThrottle(1, Duration.ofMinutes(5)), null);
+        Map<String, String> json = Map.of("Content-Type", "application/json");
+        send(throttled, "POST", "/api/login", json, obj("username", "ghost", "password", "Wrong1234"));
+        assertEquals(429, send(throttled, "POST", "/api/login", json, obj("username", "ghost", "password", "Wrong1234")).status());
+        // the main test server has no throttle at all
+        for (int i = 0; i < 5; i++) {
+            assertEquals(401, post("/api/login", null, obj("username", "ghost", "password", "Wrong1234")).status());
+        }
     }
 }

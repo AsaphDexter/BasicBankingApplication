@@ -1,6 +1,9 @@
 ### Banking API requests for IntelliJ's built-in HTTP client.
 ### Start the API first (run BankingApiApp), then click the green arrow next to a request.
 ### Run them top to bottom: login saves the token, and the later requests use it.
+### The admin requests need the API started with --admin-token, and the same value below.
+
+@adminToken = replace-with-the-admin-token-you-started-the-api-with
 
 ### Health check
 GET http://localhost:8080/api/health
@@ -73,6 +76,29 @@ Content-Type: application/json
 ### Transaction history
 GET http://localhost:8080/api/transactions
 Authorization: Bearer {{token}}
+
+### Change password (other sessions end; this one stays signed in)
+POST http://localhost:8080/api/password
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "oldPassword": "Passw0rd1",
+  "newPassword": "N3wPassword"
+}
+
+### ADMIN: unlock a locked user
+POST http://localhost:8080/api/admin/unlock
+X-Admin-Token: {{adminToken}}
+Content-Type: application/json
+
+{
+  "username": "alice"
+}
+
+### ADMIN: audit log for one user (leave out username for everyone)
+GET http://localhost:8080/api/admin/audit?username=alice&limit=20
+X-Admin-Token: {{adminToken}}
 
 ### Log out (the token stops working)
 POST http://localhost:8080/api/logout

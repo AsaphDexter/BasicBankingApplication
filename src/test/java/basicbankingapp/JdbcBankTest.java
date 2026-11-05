@@ -12,7 +12,9 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.time.Duration;
 import java.util.Comparator;
+import java.util.List;
 import java.util.Optional;
 import java.util.function.Supplier;
 import java.util.stream.Stream;
@@ -93,6 +95,79 @@ class JdbcBankTest extends AbstractBankTest {
                 assertThrows(AccountLockedException.class, () -> bank2.login("alice", pw("Passw0rd1")));
                 bank2.unlock("alice");
                 assertNotNull(bank2.login("alice", pw("Passw0rd1")));
+            }
+        } finally {
+            deleteRecursively(dir);
+        }
+    }
+
+    @Test
+    void timedLockAndAuditLogSurviveRestartingTheApp() throws IOException {
+        Path dir = Files.createTempDirectory("bba-test");
+        try {
+            Path dbFile = dir.resolve("bank");
+            try (JdbcBankRepository first = JdbcBankRepository.file(dbFile)) {
+                Bank bank1 = new Bank(FAST_HASHER, first, clock, LOCKOUT);
+                bank1.register("alice", "Alice Doe", pw("Passw0rd1"));
+                for (int i = 0; i < Bank.MAX_FAILED_LOGINS; i++) {
+                    assertThrows(AuthenticationException.class, () -> bank1.login("alice", pw("Wrong0000")));
+                }
+            }
+            try (JdbcBankRepository second = JdbcBankRepository.file(dbFile)) {
+                Bank bank2 = new Bank(FAST_HASHER, second, clock, LOCKOUT);
+                assertThrows(AccountLockedException.class, () -> bank2.login("alice", pw("Passw0rd1")));
+                assertEquals(clock.instant().plus(LOCKOUT), bank2.getUser("alice").getLockedUntil());
+                clock.advance(LOCKOUT);
+                assertNotNull(bank2.login("alice", pw("Passw0rd1")));
+                assertTrue(bank2.auditLog("alice", 100).size() >= 7);
+            }
+        } finally {
+            deleteRecursively(dir);
+        }
+    }
+
+    @Test
+    void changedPasswordSurvivesRestartingTheApp() throws IOException {
+        Path dir = Files.createTempDirectory("bba-test");
+        try {
+            Path dbFile = dir.resolve("bank");
+            try (JdbcBankRepository first = JdbcBankRepository.file(dbFile)) {
+                Bank bank1 = new Bank(FAST_HASHER, first);
+                bank1.register("alice", "Alice Doe", pw("Passw0rd1"));
+                bank1.changePassword("alice", pw("Passw0rd1"), pw("N3wPassword"), null);
+            }
+            try (JdbcBankRepository second = JdbcBankRepository.file(dbFile)) {
+                Bank bank2 = new Bank(FAST_HASHER, second);
+                assertThrows(AuthenticationException.class, () -> bank2.login("alice", pw("Passw0rd1")));
+                assertNotNull(bank2.login("alice", pw("N3wPassword")));
+            }
+        } finally {
+            deleteRecursively(dir);
+        }
+    }
+
+    @Test
+    void aDatabaseCreatedBeforeTimedLockoutsIsUpgradedInPlace() throws Exception {
+        Path dir = Files.createTempDirectory("bba-test");
+        try {
+            String url = "jdbc:h2:file:" + dir.resolve("old").toAbsolutePath().toString().replace('\\', '/');
+            try (Connection c = DriverManager.getConnection(url, "sa", ""); Statement st = c.createStatement()) {
+                // the users table exactly as Stage 2 and 3 created it: no locked_until column, no audit table
+                st.execute("CREATE TABLE users (username VARCHAR(20) PRIMARY KEY, full_name VARCHAR(100) NOT NULL, "
+                    + "password_hash VARCHAR(255) NOT NULL, failed_logins INT DEFAULT 0 NOT NULL CHECK (failed_logins >= 0), "
+                    + "locked BOOLEAN DEFAULT FALSE NOT NULL)");
+                st.execute("CREATE TABLE accounts (account_number VARCHAR(20) PRIMARY KEY, "
+                    + "username VARCHAR(20) NOT NULL UNIQUE REFERENCES users(username), "
+                    + "customer_name VARCHAR(100) NOT NULL, balance DECIMAL(19, 2) NOT NULL CHECK (balance >= 0))");
+                st.execute("INSERT INTO users (username, full_name, password_hash) VALUES ('olduser', 'Old User', "
+                    + "'" + FAST_HASHER.hash(pw("Passw0rd1")) + "')");
+                st.execute("INSERT INTO accounts VALUES ('1000000001', 'olduser', 'Old User', 12.34)");
+            }
+            try (JdbcBankRepository upgraded = new JdbcBankRepository(url)) {
+                Bank bank2 = new Bank(FAST_HASHER, upgraded);
+                User user = bank2.login("olduser", pw("Passw0rd1"));
+                assertEquals(money("12.34"), bank2.findAccount(acct(user)).getBalance());
+                assertEquals(1, bank2.auditLog("olduser", 10).size()); // the audit table now exists
             }
         } finally {
             deleteRecursively(dir);
@@ -240,6 +315,21 @@ class JdbcBankTest extends AbstractBankTest {
                 throw new RepositoryException("Simulated database failure");
             }
             delegate.applyChange(accountNumber, transaction);
+        }
+
+        @Override
+        public void updatePasswordHash(String username, String newPasswordHash) {
+            delegate.updatePasswordHash(username, newPasswordHash);
+        }
+
+        @Override
+        public void appendAudit(AuditEvent event) {
+            delegate.appendAudit(event);
+        }
+
+        @Override
+        public List<AuditEvent> recentAudit(String username, int limit) {
+            return delegate.recentAudit(username, limit);
         }
 
         @Override

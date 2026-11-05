@@ -16,6 +16,10 @@ public final class ApiDtos {
 
     public record TransferRequest(String toAccountNumber, BigDecimal amount) { }
 
+    public record ChangePasswordRequest(String oldPassword, String newPassword) { }
+
+    public record UnlockRequest(String username) { }
+
     // ----- responses -----
     public record RegisterResponse(String username, String fullName, String accountNumber) { }
 
@@ -27,6 +31,8 @@ public final class ApiDtos {
 
     public record TransactionResponse(String type, BigDecimal amount, String counterparty,
                                       BigDecimal balanceAfter, String timestamp) { }
+
+    public record AuditEntryResponse(String timestamp, String type, String username, String detail) { }
 
     public record ErrorResponse(String error) { }
 

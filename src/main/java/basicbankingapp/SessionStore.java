@@ -72,6 +72,12 @@ public final class SessionStore {
         }
     }
 
+    /** Ends every session of the user except the one named (used after a password change). */
+    public void revokeAllExcept(String username, String keepToken) {
+        sessions.entrySet().removeIf(entry ->
+            entry.getValue().username().equals(username) && !entry.getKey().equals(keepToken));
+    }
+
     int activeCount() {
         purgeExpired();
         return sessions.size();

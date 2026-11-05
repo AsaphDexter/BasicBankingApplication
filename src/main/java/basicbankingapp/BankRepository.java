@@ -1,5 +1,6 @@
 package basicbankingapp;
 
+import java.util.List;
 import java.util.Optional;
 import java.util.function.Supplier;
 
@@ -8,7 +9,7 @@ import java.util.function.Supplier;
  * talks to storage only through this interface, so the storage can be swapped
  * (in memory for quick runs, H2 database for real use).
  *
- * Objects returned by a repository may be snapshots: after changing money, call
+ * Objects returned by a repository are snapshots: after changing money, call
  * {@link #applyChange}; after changing login state, call {@link #saveLoginState}.
  */
 public interface BankRepository extends AutoCloseable {
@@ -32,8 +33,15 @@ public interface BankRepository extends AutoCloseable {
 
     Optional<BankAccount> findAccount(String accountNumber);
 
-    /** Saves the user's failed-login count and locked flag. */
+    /** Saves the user's failed-login count and lock expiry. */
     void saveLoginState(User user);
+
+    void updatePasswordHash(String username, String newPasswordHash);
+
+    void appendAudit(AuditEvent event);
+
+    /** Newest first. {@code username} may be null for everyone. */
+    List<AuditEvent> recentAudit(String username, int limit);
 
     /** Saves one money movement: the new balance (taken from the transaction) and the transaction itself. */
     void applyChange(String accountNumber, Transaction transaction);

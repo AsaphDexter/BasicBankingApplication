@@ -1,5 +1,7 @@
 package basicbankingapp;
 
+import java.time.Instant;
+
 /** A registered user and their account. Passwords are never stored, only a salted hash. */
 public final class User {
 
@@ -7,22 +9,22 @@ public final class User {
     private final String fullName;
     private final String passwordHash;
     private final BankAccount account;
-    private int failedLogins;
-    private boolean locked;
+    private volatile int failedLogins;
+    private volatile Instant lockedUntil;
 
     User(String username, String fullName, String passwordHash, BankAccount account) {
-        this(username, fullName, passwordHash, account, 0, false);
+        this(username, fullName, passwordHash, account, 0, null);
     }
 
     /** Used by the storage layer to rebuild a saved user. */
     User(String username, String fullName, String passwordHash, BankAccount account,
-         int failedLogins, boolean locked) {
+         int failedLogins, Instant lockedUntil) {
         this.username = username;
         this.fullName = fullName;
         this.passwordHash = passwordHash;
         this.account = account;
         this.failedLogins = failedLogins;
-        this.locked = locked;
+        this.lockedUntil = lockedUntil;
     }
 
     public String getUsername() {
@@ -37,12 +39,23 @@ public final class User {
         return account;
     }
 
-    public boolean isLocked() {
-        return locked;
-    }
-
     public int getFailedLogins() {
         return failedLogins;
+    }
+
+    /** True if a lock was set, even if it has already run out. */
+    public boolean isLocked() {
+        return lockedUntil != null;
+    }
+
+    /** True only while the lock is still in force at the given moment. */
+    public boolean isLockedAt(Instant now) {
+        Instant until = lockedUntil;
+        return until != null && now.isBefore(until);
+    }
+
+    public Instant getLockedUntil() {
+        return lockedUntil;
     }
 
     String getPasswordHash() {
@@ -57,12 +70,12 @@ public final class User {
         failedLogins = 0;
     }
 
-    void lock() {
-        locked = true;
+    void lock(Instant until) {
+        lockedUntil = until;
     }
 
     void unlock() {
-        locked = false;
+        lockedUntil = null;
         failedLogins = 0;
     }
 }

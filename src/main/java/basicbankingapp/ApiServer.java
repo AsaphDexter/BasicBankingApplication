@@ -2,6 +2,8 @@ package basicbankingapp;
 
 import basicbankingapp.ApiDtos.AccountResponse;
 import basicbankingapp.ApiDtos.AmountRequest;
+import basicbankingapp.ApiDtos.AuditEntryResponse;
+import basicbankingapp.ApiDtos.ChangePasswordRequest;
 import basicbankingapp.ApiDtos.BalanceResponse;
 import basicbankingapp.ApiDtos.ErrorResponse;
 import basicbankingapp.ApiDtos.LoginRequest;
@@ -11,6 +13,7 @@ import basicbankingapp.ApiDtos.RegisterResponse;
 import basicbankingapp.ApiDtos.StatusResponse;
 import basicbankingapp.ApiDtos.TransactionResponse;
 import basicbankingapp.ApiDtos.TransferRequest;
+import basicbankingapp.ApiDtos.UnlockRequest;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.StreamWriteFeature;
@@ -26,7 +29,13 @@ import com.sun.net.httpserver.HttpServer;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.net.InetSocketAddress;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -44,6 +53,9 @@ import java.util.concurrent.Executors;
  * POST /api/deposit       {amount}                       (needs token)
  * POST /api/withdraw      {amount}                       (needs token)
  * POST /api/transfer      {toAccountNumber, amount}      (needs token)
+ * POST /api/password      {oldPassword, newPassword}     (needs token)
+ * POST /api/admin/unlock  {username}                     (needs the admin token)
+ * GET  /api/admin/audit?username=&limit=                 (needs the admin token)
  * </pre>
  *
  * Every protected endpoint acts only on the account of the token's owner, so there is no
@@ -69,13 +81,28 @@ public final class ApiServer implements AutoCloseable {
 
     private final Bank bank;
     private final SessionStore sessions;
+    private final LoginThrottle throttle;
+    private final String adminToken; // null: the admin endpoints do not exist
     private final HttpServer server;
     private final ExecutorService executor = Executors.newFixedThreadPool(8);
 
-    /** Binds to the address now; call {@link #start()} to begin answering requests. Use port 0 for any free port. */
+    /** No throttling and no admin endpoints. */
     public ApiServer(Bank bank, SessionStore sessions, InetSocketAddress address) throws IOException {
+        this(bank, sessions, LoginThrottle.disabled(), null, address);
+    }
+
+    /**
+     * Binds to the address now; call {@link #start()} to begin answering requests. Use port 0 for any free port.
+     *
+     * @param throttle   limits failed logins per client address
+     * @param adminToken secret for the admin endpoints, or null to switch them off
+     */
+    public ApiServer(Bank bank, SessionStore sessions, LoginThrottle throttle, String adminToken,
+                     InetSocketAddress address) throws IOException {
         this.bank = bank;
         this.sessions = sessions;
+        this.throttle = throttle;
+        this.adminToken = adminToken;
         this.server = HttpServer.create(address, 0);
         this.server.createContext("/", this::handle);
         this.server.setExecutor(executor);
@@ -101,6 +128,9 @@ public final class ApiServer implements AutoCloseable {
         try {
             route(exchange);
         } catch (ApiException e) {
+            if (e.retryAfterSeconds() != null) {
+                exchange.getResponseHeaders().set("Retry-After", String.valueOf(e.retryAfterSeconds()));
+            }
             send(exchange, e.status(), new ErrorResponse(e.getMessage()));
         } catch (Exception e) {
             e.printStackTrace(); // the details stay in the server log, not in the response
@@ -151,6 +181,18 @@ public final class ApiServer implements AutoCloseable {
                 requireMethod(ex, "POST");
                 transfer(ex);
             }
+            case "/api/password" -> {
+                requireMethod(ex, "POST");
+                changePassword(ex);
+            }
+            case "/api/admin/unlock" -> {
+                requireMethod(ex, "POST");
+                adminUnlock(ex);
+            }
+            case "/api/admin/audit" -> {
+                requireMethod(ex, "GET");
+                adminAudit(ex);
+            }
             default -> throw new ApiException(404, "Not found");
         }
     }
@@ -174,16 +216,20 @@ public final class ApiServer implements AutoCloseable {
     }
 
     private void login(HttpExchange ex) throws IOException {
+        String client = clientAddress(ex);
+        checkNotThrottled(client);
         LoginRequest request = readJson(ex, LoginRequest.class);
         require(request.username(), "username");
         require(request.password(), "password");
         try {
-            User user = bank.login(request.username(), request.password().toCharArray());
+            User user = bank.login(request.username(), request.password().toCharArray(), client);
             String token = sessions.create(user.getUsername());
             send(ex, 200, new LoginResponse(token, "Bearer", sessions.getLifetime().toSeconds()));
         } catch (AccountLockedException e) {
-            throw new ApiException(423, e.getMessage());
+            throttle.recordFailure(client);
+            throw new ApiException(423, e.getMessage(), e.getRetryAfterSeconds());
         } catch (AuthenticationException e) {
+            throttle.recordFailure(client);
             throw new ApiException(401, e.getMessage());
         }
     }
@@ -224,11 +270,124 @@ public final class ApiServer implements AutoCloseable {
         TransferRequest request = readJson(ex, TransferRequest.class);
         require(request.toAccountNumber(), "toAccountNumber");
         BigDecimal amount = requireAmount(request.amount());
-        perform(() -> bank.transfer(accountNumber(user), request.toAccountNumber().trim(), amount));
+        perform(() -> bank.transfer(accountNumber(user), request.toAccountNumber().trim(), amount, user.getUsername()));
         send(ex, 200, new BalanceResponse(bank.findAccount(accountNumber(user)).getBalance()));
     }
 
+    private void changePassword(HttpExchange ex) throws IOException {
+        User user = authenticate(ex);
+        String client = clientAddress(ex);
+        checkNotThrottled(client);
+        ChangePasswordRequest request = readJson(ex, ChangePasswordRequest.class);
+        require(request.oldPassword(), "oldPassword");
+        require(request.newPassword(), "newPassword");
+        try {
+            bank.changePassword(user.getUsername(), request.oldPassword().toCharArray(),
+                request.newPassword().toCharArray(), client);
+        } catch (AccountLockedException e) {
+            throttle.recordFailure(client);
+            throw new ApiException(423, e.getMessage(), e.getRetryAfterSeconds());
+        } catch (AuthenticationException e) {
+            throttle.recordFailure(client);
+            throw new ApiException(403, e.getMessage());
+        } catch (RegistrationException e) {
+            throw new ApiException(400, e.getMessage());
+        }
+        sessions.revokeAllExcept(user.getUsername(), bearerToken(ex)); // other devices must sign in again
+        sendNoContent(ex);
+    }
+
+    // ---------- admin endpoints ----------
+
+    private void adminUnlock(HttpExchange ex) throws IOException {
+        requireAdmin(ex);
+        UnlockRequest request = readJson(ex, UnlockRequest.class);
+        require(request.username(), "username");
+        try {
+            bank.unlock(request.username());
+        } catch (UserNotFoundException e) {
+            throw new ApiException(404, e.getMessage());
+        }
+        sendNoContent(ex);
+    }
+
+    private void adminAudit(HttpExchange ex) throws IOException {
+        requireAdmin(ex);
+        Map<String, String> query = queryParameters(ex);
+        int limit = 50;
+        if (query.containsKey("limit")) {
+            try {
+                limit = Integer.parseInt(query.get("limit"));
+            } catch (NumberFormatException e) {
+                throw new ApiException(400, "limit must be a whole number from 1 to 200");
+            }
+            if (limit < 1 || limit > 200) {
+                throw new ApiException(400, "limit must be a whole number from 1 to 200");
+            }
+        }
+        List<AuditEntryResponse> entries = bank.auditLog(query.get("username"), limit).stream()
+            .map(event -> new AuditEntryResponse(event.time().toString(), event.type().name(),
+                event.username(), event.detail()))
+            .toList();
+        send(ex, 200, entries);
+    }
+
+    private void requireAdmin(HttpExchange ex) {
+        if (adminToken == null) {
+            throw new ApiException(404, "Not found"); // the admin API is switched off, so it does not exist
+        }
+        String client = clientAddress(ex);
+        checkNotThrottled(client);
+        String supplied = ex.getRequestHeaders().getFirst("X-Admin-Token");
+        if (supplied == null || !sameSecret(supplied, adminToken)) {
+            throttle.recordFailure(client);
+            throw new ApiException(401, "Admin token required");
+        }
+    }
+
+    /** Compares secrets in constant time, whatever their lengths. */
+    private static boolean sameSecret(String supplied, String expected) {
+        try {
+            MessageDigest sha = MessageDigest.getInstance("SHA-256");
+            return MessageDigest.isEqual(sha.digest(supplied.getBytes(StandardCharsets.UTF_8)),
+                sha.digest(expected.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
     // ---------- helpers ----------
+
+    private void checkNotThrottled(String client) {
+        throttle.retryAfter(client).ifPresent(wait -> {
+            throw new ApiException(429, "Too many failed attempts. Try again later",
+                Math.max(1, (wait.toMillis() + 999) / 1000));
+        });
+    }
+
+    private static String clientAddress(HttpExchange ex) {
+        return ex.getRemoteAddress().getAddress().getHostAddress();
+    }
+
+    private static Map<String, String> queryParameters(HttpExchange ex) {
+        Map<String, String> parameters = new HashMap<>();
+        String raw = ex.getRequestURI().getRawQuery();
+        if (raw == null || raw.isEmpty()) {
+            return parameters;
+        }
+        for (String pair : raw.split("&")) {
+            int equals = pair.indexOf('=');
+            String name = equals < 0 ? pair : pair.substring(0, equals);
+            String value = equals < 0 ? "" : pair.substring(equals + 1);
+            try {
+                parameters.put(URLDecoder.decode(name, StandardCharsets.UTF_8),
+                    URLDecoder.decode(value, StandardCharsets.UTF_8));
+            } catch (IllegalArgumentException e) {
+                throw new ApiException(400, "Bad query string");
+            }
+        }
+        return parameters;
+    }
 
     private static String accountNumber(User user) {
         return user.getAccount().getCustomerId();

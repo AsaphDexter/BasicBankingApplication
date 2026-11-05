@@ -10,7 +10,10 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.sql.Types;
+import java.time.Instant;
 import java.time.LocalDateTime;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -128,14 +131,13 @@ public final class JdbcBankRepository implements BankRepository {
         runInTransaction(() -> {
             BankAccount account = user.getAccount();
             try (PreparedStatement insertUser = connection.prepareStatement(
-                     "INSERT INTO users (username, full_name, password_hash, failed_logins, locked) VALUES (?, ?, ?, ?, ?)");
+                     "INSERT INTO users (username, full_name, password_hash, failed_logins) VALUES (?, ?, ?, ?)");
                  PreparedStatement insertAccount = connection.prepareStatement(
                      "INSERT INTO accounts (account_number, username, customer_name, balance) VALUES (?, ?, ?, ?)")) {
                 insertUser.setString(1, user.getUsername());
                 insertUser.setString(2, user.getFullName());
                 insertUser.setString(3, user.getPasswordHash());
                 insertUser.setInt(4, user.getFailedLogins());
-                insertUser.setBoolean(5, user.isLocked());
                 insertUser.executeUpdate();
 
                 insertAccount.setString(1, account.getCustomerId());
@@ -154,7 +156,7 @@ public final class JdbcBankRepository implements BankRepository {
 
     @Override
     public synchronized Optional<User> findUser(String username) {
-        String sql = "SELECT u.username, u.full_name, u.password_hash, u.failed_logins, u.locked, "
+        String sql = "SELECT u.username, u.full_name, u.password_hash, u.failed_logins, u.locked_until, "
             + "a.account_number, a.customer_name, a.balance "
             + "FROM users u JOIN accounts a ON a.username = u.username WHERE u.username = ?";
         try (PreparedStatement ps = connection.prepareStatement(sql)) {
@@ -166,8 +168,10 @@ public final class JdbcBankRepository implements BankRepository {
                 String accountNumber = rs.getString("account_number");
                 BankAccount account = BankAccount.restore(rs.getString("customer_name"), accountNumber,
                     rs.getBigDecimal("balance"), loadHistory(accountNumber));
+                LocalDateTime lockedUntil = rs.getObject("locked_until", LocalDateTime.class);
                 return Optional.of(new User(rs.getString("username"), rs.getString("full_name"),
-                    rs.getString("password_hash"), account, rs.getInt("failed_logins"), rs.getBoolean("locked")));
+                    rs.getString("password_hash"), account, rs.getInt("failed_logins"),
+                    lockedUntil == null ? null : lockedUntil.toInstant(ZoneOffset.UTC)));
             }
         } catch (SQLException e) {
             throw new RepositoryException("Could not load the user", e);
@@ -177,9 +181,13 @@ public final class JdbcBankRepository implements BankRepository {
     @Override
     public synchronized void saveLoginState(User user) {
         try (PreparedStatement ps = connection.prepareStatement(
-                 "UPDATE users SET failed_logins = ?, locked = ? WHERE username = ?")) {
+                 "UPDATE users SET failed_logins = ?, locked_until = ? WHERE username = ?")) {
             ps.setInt(1, user.getFailedLogins());
-            ps.setBoolean(2, user.isLocked());
+            if (user.getLockedUntil() == null) {
+                ps.setNull(2, Types.TIMESTAMP);
+            } else {
+                ps.setObject(2, LocalDateTime.ofInstant(user.getLockedUntil(), ZoneOffset.UTC));
+            }
             ps.setString(3, user.getUsername());
             ps.executeUpdate();
         } catch (SQLException e) {
@@ -233,6 +241,59 @@ public final class JdbcBankRepository implements BankRepository {
     }
 
     @Override
+    public synchronized void updatePasswordHash(String username, String newPasswordHash) {
+        try (PreparedStatement ps = connection.prepareStatement(
+                 "UPDATE users SET password_hash = ? WHERE username = ?")) {
+            ps.setString(1, newPasswordHash);
+            ps.setString(2, username);
+            if (ps.executeUpdate() != 1) {
+                throw new RepositoryException("User not found: " + username);
+            }
+        } catch (SQLException e) {
+            throw new RepositoryException("Could not change the password", e);
+        }
+    }
+
+    @Override
+    public synchronized void appendAudit(AuditEvent event) {
+        try (PreparedStatement ps = connection.prepareStatement(
+                 "INSERT INTO audit_events (created_at, event_type, username, detail) VALUES (?, ?, ?, ?)")) {
+            ps.setObject(1, LocalDateTime.ofInstant(event.time(), ZoneOffset.UTC));
+            ps.setString(2, event.type().name());
+            ps.setString(3, event.username());
+            ps.setString(4, event.detail());
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new RepositoryException("Could not write the audit log", e);
+        }
+    }
+
+    @Override
+    public synchronized List<AuditEvent> recentAudit(String username, int limit) {
+        String sql = "SELECT created_at, event_type, username, detail FROM audit_events "
+            + (username == null ? "" : "WHERE username = ? ")
+            + "ORDER BY id DESC LIMIT ?";
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            int index = 1;
+            if (username != null) {
+                ps.setString(index++, username);
+            }
+            ps.setInt(index, limit);
+            List<AuditEvent> events = new ArrayList<>();
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    Instant time = rs.getObject("created_at", LocalDateTime.class).toInstant(ZoneOffset.UTC);
+                    events.add(new AuditEvent(time, AuditEvent.Type.valueOf(rs.getString("event_type")),
+                        rs.getString("username"), rs.getString("detail")));
+                }
+            }
+            return events;
+        } catch (SQLException e) {
+            throw new RepositoryException("Could not read the audit log", e);
+        }
+    }
+
+    @Override
     public synchronized String nextAccountNumber() {
         try (Statement st = connection.createStatement();
              ResultSet rs = st.executeQuery("SELECT NEXT VALUE FOR account_number_seq")) {
@@ -279,7 +340,10 @@ public final class JdbcBankRepository implements BankRepository {
                 + "full_name VARCHAR(100) NOT NULL, "
                 + "password_hash VARCHAR(255) NOT NULL, "
                 + "failed_logins INT DEFAULT 0 NOT NULL CHECK (failed_logins >= 0), "
-                + "locked BOOLEAN DEFAULT FALSE NOT NULL)");
+                + "locked BOOLEAN DEFAULT FALSE NOT NULL, "   // no longer used; kept so older databases still open
+                + "locked_until TIMESTAMP)");
+            // Databases created before timed lockouts: add the new column. Old permanent locks are released.
+            st.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMP");
             st.execute("CREATE TABLE IF NOT EXISTS accounts ("
                 + "account_number VARCHAR(20) PRIMARY KEY, "
                 + "username VARCHAR(20) NOT NULL UNIQUE REFERENCES users(username), "
@@ -293,6 +357,13 @@ public final class JdbcBankRepository implements BankRepository {
                 + "balance_after DECIMAL(19, 2) NOT NULL CHECK (balance_after >= 0), "
                 + "created_at TIMESTAMP NOT NULL, "
                 + "counterparty VARCHAR(20))");
+            st.execute("CREATE TABLE IF NOT EXISTS audit_events ("
+                + "id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, "
+                + "created_at TIMESTAMP NOT NULL, "
+                + "event_type VARCHAR(30) NOT NULL, "
+                + "username VARCHAR(50), "
+                + "detail VARCHAR(200))");
+            st.execute("CREATE INDEX IF NOT EXISTS idx_audit_username ON audit_events(username, id)");
             st.execute("CREATE INDEX IF NOT EXISTS idx_transactions_account ON transactions(account_number, id)");
             st.execute("CREATE SEQUENCE IF NOT EXISTS account_number_seq START WITH 1000000001");
         }

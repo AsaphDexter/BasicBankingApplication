@@ -12,7 +12,7 @@ import javax.crypto.spec.PBEKeySpec;
  * Stored format: {@code pbkdf2_sha256$iterations$salt$hash} (salt and hash Base64).
  * The iteration count is stored with each hash, so it can be raised later without breaking old hashes.
  */
-public final class PasswordHasher {
+public class PasswordHasher {
 
     public static final int DEFAULT_ITERATIONS = 600_000;
     private static final String ALGORITHM = "PBKDF2WithHmacSHA256";

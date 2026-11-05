@@ -1,24 +1,35 @@
 package basicbankingapp;
 
 import java.math.BigDecimal;
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.Arrays;
+import java.util.List;
 import java.util.regex.Pattern;
 
 /**
- * The rules for users, sign-in, deposits, withdrawals and transfers.
+ * The rules for users, sign-in, passwords, deposits, withdrawals and transfers.
  * Storage is behind {@link BankRepository}, and every money movement runs as one
- * all-or-nothing transaction. Every public method is synchronized, so one Bank can be shared
- * by several threads (for example the web server's request threads).
+ * all-or-nothing transaction.
+ *
+ * Thread-safe. Password hashing is slow on purpose, so it always runs OUTSIDE the lock:
+ * a sign-in never makes other customers wait. Only the short read-change-save steps hold the lock.
  */
 public class Bank {
 
     public static final int MAX_FAILED_LOGINS = 3;
+    public static final Duration DEFAULT_LOCKOUT = Duration.ofMinutes(15);
     private static final Pattern USERNAME = Pattern.compile("[A-Za-z0-9_]{3,20}");
     private static final String BAD_LOGIN = "Invalid username or password";
+    private static final String BAD_OLD_PASSWORD = "Current password is incorrect";
 
     private final PasswordHasher hasher;
     private final BankRepository repository;
+    private final Clock clock;
+    private final Duration lockout;
     private final String dummyHash;
+    private final Object lock = new Object();
 
     /** In-memory bank with the default (strong) password hashing. */
     public Bank() {
@@ -26,15 +37,26 @@ public class Bank {
     }
 
     public Bank(PasswordHasher hasher, BankRepository repository) {
+        this(hasher, repository, Clock.systemUTC(), DEFAULT_LOCKOUT);
+    }
+
+    public Bank(PasswordHasher hasher, BankRepository repository, Clock clock, Duration lockout) {
+        if (lockout == null || lockout.isZero() || lockout.isNegative()) {
+            throw new IllegalArgumentException("Lockout must be positive");
+        }
         this.hasher = hasher;
         this.repository = repository;
+        this.clock = clock;
+        this.lockout = lockout;
         // Checked against when the username does not exist, so a login for an unknown user
         // takes about as long as a real one and gives nothing away.
         this.dummyHash = hasher.hash("not-a-real-password".toCharArray());
     }
 
+    // ---------- registration ----------
+
     /** Registers a user and opens their account. The password array is wiped before returning. */
-    public synchronized User register(String username, String fullName, char[] password) {
+    public User register(String username, String fullName, char[] password) {
         try {
             String key = normalize(username);
             if (key == null || !USERNAME.matcher(key).matches()) {
@@ -46,114 +68,296 @@ public class Bank {
             }
             checkPasswordStrength(key, password);
             String name = fullName.trim();
-            String passwordHash = hasher.hash(password);
+            String passwordHash = hasher.hash(password); // slow: done before taking the lock
 
-            return repository.inTransaction(() -> {
-                if (repository.usernameExists(key)) {
-                    throw new UsernameTakenException();
-                }
-                BankAccount account = new BankAccount(name, repository.nextAccountNumber());
-                User user = new User(key, name, passwordHash, account);
-                repository.insertUser(user);
-                return user;
-            });
+            synchronized (lock) {
+                return repository.inTransaction(() -> {
+                    if (repository.usernameExists(key)) {
+                        throw new UsernameTakenException();
+                    }
+                    BankAccount account = new BankAccount(name, repository.nextAccountNumber());
+                    User user = new User(key, name, passwordHash, account);
+                    repository.insertUser(user);
+                    audit(AuditEvent.Type.REGISTERED, key, "account " + account.getCustomerId());
+                    return user;
+                });
+            }
         } finally {
             wipe(password);
         }
+    }
+
+    // ---------- login ----------
+
+    public User login(String username, char[] password) {
+        return login(username, password, null);
     }
 
     /**
      * Signs a user in. The same message is used for an unknown user and a wrong password.
-     * After {@value #MAX_FAILED_LOGINS} failures in a row the user is locked until {@link #unlock}.
+     * After {@value #MAX_FAILED_LOGINS} failures in a row the user is locked for the lockout period
+     * (or until {@link #unlock}). {@code clientAddress} is only recorded in the audit log.
      * The password array is wiped before returning.
      */
-    public synchronized User login(String username, char[] password) {
+    public User login(String username, char[] password, String clientAddress) {
         try {
             String key = normalize(username);
-            User user = key == null ? null : repository.findUser(key).orElse(null);
-            if (user == null) {
+            User seen = key == null ? null : repository.findUser(key).orElse(null);
+            if (seen == null) {
                 hasher.verify(password, dummyHash);
+                audit(AuditEvent.Type.LOGIN_FAILED, key, "unknown user" + client(clientAddress));
                 throw new AuthenticationException(BAD_LOGIN);
             }
-            if (user.isLocked()) {
-                throw new AccountLockedException("This account is locked after too many failed attempts");
+            Instant now = clock.instant();
+            if (seen.isLockedAt(now)) {
+                throw blocked(seen, now, clientAddress);
             }
-            if (hasher.verify(password, user.getPasswordHash())) {
-                if (user.getFailedLogins() > 0) {
-                    user.resetFailedLogins();
-                    repository.saveLoginState(user);
-                }
-                return user;
+            boolean correct = hasher.verify(password, seen.getPasswordHash()); // slow: outside the lock
+
+            Outcome outcome;
+            synchronized (lock) {
+                outcome = repository.inTransaction(() -> {
+                    User user = repository.findUser(key).orElse(null);
+                    if (user == null) {
+                        return Outcome.failed(new AuthenticationException(BAD_LOGIN));
+                    }
+                    Instant at = clock.instant();
+                    if (user.isLockedAt(at)) {
+                        return Outcome.failed(blocked(user, at, clientAddress));
+                    }
+                    if (user.isLocked()) { // the lock has run out: start again with a clean count
+                        user.unlock();
+                    }
+                    boolean stillValid = correct && user.getPasswordHash().equals(seen.getPasswordHash());
+                    if (stillValid) {
+                        if (user.getFailedLogins() > 0 || seen.isLocked()) {
+                            user.resetFailedLogins();
+                            repository.saveLoginState(user);
+                        }
+                        audit(AuditEvent.Type.LOGIN_SUCCESS, key, client(clientAddress).trim());
+                        return Outcome.ok(user);
+                    }
+                    return Outcome.failed(failedAttempt(user, at, "wrong password", BAD_LOGIN, clientAddress));
+                });
             }
-            user.recordFailedLogin();
-            boolean nowLocked = user.getFailedLogins() >= MAX_FAILED_LOGINS;
-            if (nowLocked) {
-                user.lock();
-            }
-            repository.saveLoginState(user);
-            if (nowLocked) {
-                throw new AccountLockedException("Too many failed attempts. This account is now locked");
-            }
-            throw new AuthenticationException(BAD_LOGIN);
+            // The exception is thrown only now, after the transaction committed, so the failure
+            // count and audit entries are kept rather than rolled back with it.
+            return outcome.userOrThrow();
         } finally {
             wipe(password);
         }
     }
 
-    /** For a future admin feature: lets a locked user sign in again. */
-    public synchronized void unlock(String username) {
+    /** For administrators: lets a locked user sign in again right away. */
+    public void unlock(String username) {
         String key = normalize(username);
-        User user = key == null ? null : repository.findUser(key).orElse(null);
-        if (user == null) {
-            throw new IllegalArgumentException("Unknown user");
+        synchronized (lock) {
+            repository.runInTransaction(() -> {
+                User user = key == null ? null : repository.findUser(key).orElse(null);
+                if (user == null) {
+                    throw new UserNotFoundException();
+                }
+                user.unlock();
+                repository.saveLoginState(user);
+                audit(AuditEvent.Type.ACCOUNT_UNLOCKED, key, "by administrator");
+            });
         }
-        user.unlock();
-        repository.saveLoginState(user);
     }
 
+    // ---------- password change ----------
+
+    /**
+     * Changes a password after checking the current one. A wrong current password counts as a failed
+     * login (so a stolen session cannot be used to guess the password). Both arrays are wiped.
+     */
+    public void changePassword(String username, char[] oldPassword, char[] newPassword, String clientAddress) {
+        try {
+            String key = normalize(username);
+            User seen = key == null ? null : repository.findUser(key).orElse(null);
+            if (seen == null) {
+                throw new AuthenticationException(BAD_OLD_PASSWORD);
+            }
+            Instant now = clock.instant();
+            if (seen.isLockedAt(now)) {
+                throw blocked(seen, now, clientAddress);
+            }
+            boolean correct = hasher.verify(oldPassword, seen.getPasswordHash()); // slow: outside the lock
+            String newHash = null;
+            if (correct) {
+                checkPasswordStrength(key, newPassword);
+                if (hasher.verify(newPassword, seen.getPasswordHash())) {
+                    throw new RegistrationException("New password must be different from the current one");
+                }
+                newHash = hasher.hash(newPassword);
+            }
+            String hashToStore = newHash;
+
+            Outcome outcome;
+            synchronized (lock) {
+                outcome = repository.inTransaction(() -> {
+                    User user = repository.findUser(key).orElse(null);
+                    if (user == null) {
+                        return Outcome.failed(new AuthenticationException(BAD_OLD_PASSWORD));
+                    }
+                    Instant at = clock.instant();
+                    if (user.isLockedAt(at)) {
+                        return Outcome.failed(blocked(user, at, clientAddress));
+                    }
+                    if (user.isLocked()) {
+                        user.unlock();
+                    }
+                    if (!correct || !user.getPasswordHash().equals(seen.getPasswordHash())) {
+                        return Outcome.failed(failedAttempt(user, at, "wrong current password",
+                            BAD_OLD_PASSWORD, clientAddress));
+                    }
+                    repository.updatePasswordHash(key, hashToStore);
+                    user.resetFailedLogins();
+                    repository.saveLoginState(user);
+                    audit(AuditEvent.Type.PASSWORD_CHANGED, key, client(clientAddress).trim());
+                    return Outcome.ok(user);
+                });
+            }
+            outcome.userOrThrow();
+        } finally {
+            wipe(oldPassword);
+            wipe(newPassword);
+        }
+    }
+
+    // ---------- reading ----------
+
     /** A snapshot of the user as stored right now, or null. */
-    public synchronized User getUser(String username) {
+    public User getUser(String username) {
         String key = normalize(username);
         return key == null ? null : repository.findUser(key).orElse(null);
     }
 
     /** A snapshot of the account as stored right now, or null. */
-    public synchronized BankAccount findAccount(String accountNumber) {
+    public BankAccount findAccount(String accountNumber) {
         return repository.findAccount(accountNumber).orElse(null);
     }
 
-    public synchronized void deposit(String accountNumber, BigDecimal amount) {
-        repository.runInTransaction(() -> {
-            BankAccount account = requireAccount(accountNumber);
-            account.deposit(amount);
-            save(account);
-        });
+    /** Newest first. {@code username} may be null for all users. */
+    public List<AuditEvent> auditLog(String username, int limit) {
+        return repository.recentAudit(normalize(username), limit);
     }
 
-    public synchronized void withdraw(String accountNumber, BigDecimal amount) {
-        repository.runInTransaction(() -> {
-            BankAccount account = requireAccount(accountNumber);
-            account.withdraw(amount);
-            save(account);
-        });
+    // ---------- money ----------
+
+    public void deposit(String accountNumber, BigDecimal amount) {
+        synchronized (lock) {
+            repository.runInTransaction(() -> {
+                BankAccount account = requireAccount(accountNumber);
+                account.deposit(amount);
+                save(account);
+            });
+        }
+    }
+
+    public void withdraw(String accountNumber, BigDecimal amount) {
+        synchronized (lock) {
+            repository.runInTransaction(() -> {
+                BankAccount account = requireAccount(accountNumber);
+                account.withdraw(amount);
+                save(account);
+            });
+        }
     }
 
     /**
      * Moves money between two accounts as one all-or-nothing transaction:
      * if anything fails, neither balance changes.
      */
-    public synchronized void transfer(String fromAccountNumber, String toAccountNumber, BigDecimal amount) {
-        repository.runInTransaction(() -> {
-            BankAccount from = requireAccount(fromAccountNumber);
-            BankAccount to = requireAccount(toAccountNumber);
-            if (from.getCustomerId().equals(to.getCustomerId())) {
-                throw new IllegalArgumentException("You cannot transfer to the same account");
+    public void transfer(String fromAccountNumber, String toAccountNumber, BigDecimal amount) {
+        transfer(fromAccountNumber, toAccountNumber, amount, null);
+    }
+
+    /** Same as above; {@code actingUsername} (may be null) is recorded in the audit log. */
+    public void transfer(String fromAccountNumber, String toAccountNumber, BigDecimal amount, String actingUsername) {
+        synchronized (lock) {
+            repository.runInTransaction(() -> {
+                BankAccount from = requireAccount(fromAccountNumber);
+                BankAccount to = requireAccount(toAccountNumber);
+                if (from.getCustomerId().equals(to.getCustomerId())) {
+                    throw new IllegalArgumentException("You cannot transfer to the same account");
+                }
+                from.sendTransfer(amount, to.getCustomerId()); // validates amount and funds first
+                to.receiveTransfer(amount, from.getCustomerId());
+                save(from);
+                save(to);
+                audit(AuditEvent.Type.TRANSFER, actingUsername == null ? null : normalize(actingUsername), "from " + from.getCustomerId() + " to "
+                    + to.getCustomerId() + " amount " + amount.setScale(2, java.math.RoundingMode.UNNECESSARY));
+            });
+        }
+    }
+
+    // ---------- helpers ----------
+
+    /** Result of a login-style transaction: either a user, or the failure to throw once it has committed. */
+    private record Outcome(User user, RuntimeException failure) {
+        static Outcome ok(User user) {
+            return new Outcome(user, null);
+        }
+
+        static Outcome failed(RuntimeException failure) {
+            return new Outcome(null, failure);
+        }
+
+        User userOrThrow() {
+            if (failure != null) {
+                throw failure;
             }
-            from.sendTransfer(amount, to.getCustomerId()); // validates amount and funds first
-            to.receiveTransfer(amount, from.getCustomerId());
-            save(from);
-            save(to);
-        });
+            return user;
+        }
+    }
+
+    /** Counts a failed attempt, locks the user at the limit, and returns the exception to throw. */
+    private AuthenticationException failedAttempt(User user, Instant at, String reason, String message,
+                                                  String clientAddress) {
+        user.recordFailedLogin();
+        boolean lockNow = user.getFailedLogins() >= MAX_FAILED_LOGINS;
+        if (lockNow) {
+            user.lock(at.plus(lockout));
+        }
+        repository.saveLoginState(user);
+        audit(AuditEvent.Type.LOGIN_FAILED, user.getUsername(), reason + client(clientAddress));
+        if (lockNow) {
+            audit(AuditEvent.Type.ACCOUNT_LOCKED, user.getUsername(), "locked for " + lockout.toMinutes()
+                + " min after " + MAX_FAILED_LOGINS + " failed attempts");
+            return new AccountLockedException("Too many failed attempts. This account is now locked",
+                secondsUntil(user.getLockedUntil(), at));
+        }
+        return new AuthenticationException(message);
+    }
+
+    private AccountLockedException blocked(User user, Instant now, String clientAddress) {
+        audit(AuditEvent.Type.LOGIN_BLOCKED, user.getUsername(), "account is locked" + client(clientAddress));
+        return new AccountLockedException("This account is locked after too many failed attempts",
+            secondsUntil(user.getLockedUntil(), now));
+    }
+
+    private static long secondsUntil(Instant until, Instant now) {
+        long millis = Duration.between(now, until).toMillis();
+        return Math.max(1, (millis + 999) / 1000);
+    }
+
+    private void audit(AuditEvent.Type type, String username, String detail) {
+        String safeName = username == null ? null : cleanForLog(username, 50);
+        repository.appendAudit(new AuditEvent(clock.instant(), type, safeName, cleanForLog(detail, 200)));
+    }
+
+    /** Keeps attacker-supplied text from forging log lines: control characters become '?' and length is capped. */
+    private static String cleanForLog(String text, int maxLength) {
+        StringBuilder cleaned = new StringBuilder();
+        for (int i = 0; i < text.length() && cleaned.length() < maxLength; i++) {
+            char c = text.charAt(i);
+            cleaned.append(Character.isISOControl(c) ? '?' : c);
+        }
+        return cleaned.toString();
+    }
+
+    private static String client(String clientAddress) {
+        return clientAddress == null ? "" : " client=" + clientAddress;
     }
 
     /** Stores the newest transaction of an account that was just changed. */
