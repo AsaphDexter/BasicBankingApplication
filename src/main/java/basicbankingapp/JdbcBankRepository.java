@@ -294,6 +294,50 @@ public final class JdbcBankRepository implements BankRepository {
     }
 
     @Override
+    public synchronized Optional<IdempotencyRecord> findIdempotencyRecord(String username, String key) {
+        try (PreparedStatement ps = connection.prepareStatement(
+                 "SELECT fingerprint, result, created_at FROM idempotency_keys WHERE username = ? AND idem_key = ?")) {
+            ps.setString(1, username);
+            ps.setString(2, key);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) {
+                    return Optional.empty();
+                }
+                Instant created = rs.getObject("created_at", LocalDateTime.class).toInstant(ZoneOffset.UTC);
+                return Optional.of(new IdempotencyRecord(username, key, rs.getString("fingerprint"),
+                    rs.getString("result"), created));
+            }
+        } catch (SQLException e) {
+            throw new RepositoryException("Could not read the idempotency record", e);
+        }
+    }
+
+    @Override
+    public synchronized void saveIdempotencyRecord(IdempotencyRecord record) {
+        try (PreparedStatement ps = connection.prepareStatement(
+                 "INSERT INTO idempotency_keys (username, idem_key, fingerprint, result, created_at) VALUES (?, ?, ?, ?, ?)")) {
+            ps.setString(1, record.username());
+            ps.setString(2, record.key());
+            ps.setString(3, record.fingerprint());
+            ps.setString(4, record.result());
+            ps.setObject(5, LocalDateTime.ofInstant(record.createdAt(), ZoneOffset.UTC));
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new RepositoryException("Could not save the idempotency record", e);
+        }
+    }
+
+    @Override
+    public synchronized void deleteIdempotencyRecordsBefore(Instant cutoff) {
+        try (PreparedStatement ps = connection.prepareStatement("DELETE FROM idempotency_keys WHERE created_at <= ?")) {
+            ps.setObject(1, LocalDateTime.ofInstant(cutoff, ZoneOffset.UTC));
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new RepositoryException("Could not clean up idempotency records", e);
+        }
+    }
+
+    @Override
     public synchronized String nextAccountNumber() {
         try (Statement st = connection.createStatement();
              ResultSet rs = st.executeQuery("SELECT NEXT VALUE FOR account_number_seq")) {
@@ -363,6 +407,14 @@ public final class JdbcBankRepository implements BankRepository {
                 + "event_type VARCHAR(30) NOT NULL, "
                 + "username VARCHAR(50), "
                 + "detail VARCHAR(200))");
+            st.execute("CREATE TABLE IF NOT EXISTS idempotency_keys ("
+                + "username VARCHAR(20) NOT NULL REFERENCES users(username), "
+                + "idem_key VARCHAR(64) NOT NULL, "
+                + "fingerprint VARCHAR(64) NOT NULL, "
+                + "result VARCHAR(2000) NOT NULL, "
+                + "created_at TIMESTAMP NOT NULL, "
+                + "PRIMARY KEY (username, idem_key))");
+            st.execute("CREATE INDEX IF NOT EXISTS idx_idempotency_created ON idempotency_keys(created_at)");
             st.execute("CREATE INDEX IF NOT EXISTS idx_audit_username ON audit_events(username, id)");
             st.execute("CREATE INDEX IF NOT EXISTS idx_transactions_account ON transactions(account_number, id)");
             st.execute("CREATE SEQUENCE IF NOT EXISTS account_number_seq START WITH 1000000001");

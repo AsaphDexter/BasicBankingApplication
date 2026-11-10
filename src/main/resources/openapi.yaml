@@ -1,0 +1,532 @@
+openapi: 3.0.3
+info:
+  title: Basic Banking API
+  version: 1.0.0
+  description: |
+    A small banking REST API: customers register, sign in, move money and change their password.
+
+    **Authentication.** `POST /api/login` returns a bearer token. Send it as `Authorization: Bearer <token>`.
+    Protected endpoints only ever act on the token owner's account.
+
+    **Safe retries.** `deposit`, `withdraw` and `transfer` accept an optional `Idempotency-Key` header. Sending
+    the same key with the same request again returns the first answer (header `Idempotent-Replayed: true`) and
+    moves no money. The same key with a different request is refused with 422. Keys expire after 24 hours.
+    Only successful requests are remembered, so a request that failed can be repeated with the same key.
+
+    **Money.** Amounts are decimal numbers with at most 2 decimal places, above 0 and at most 1,000,000,000.
+    Timestamps are UTC in ISO 8601 (for example `2026-11-08T10:15:30.123456Z`).
+
+    **Not described here.** Answers that do not belong to one operation are not listed: 404 for an unknown path,
+    405 (with an `Allow` header) for a method an endpoint does not support, and 500 for an unexpected server error.
+    All errors have the shape `{"error": "message"}`.
+  license:
+    name: MIT
+servers:
+  - url: http://localhost:8080
+    description: A local instance (plain HTTP, localhost only by default)
+
+tags:
+  - name: Service
+  - name: Customers
+  - name: Money
+  - name: Admin
+
+paths:
+  /api/health:
+    get:
+      tags: [Service]
+      summary: Is the service up?
+      operationId: health
+      responses:
+        '200':
+          description: The service is running.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StatusResponse' }
+
+  /api/openapi.yaml:
+    get:
+      tags: [Service]
+      summary: This document
+      operationId: openApiDocument
+      responses:
+        '200':
+          description: The OpenAPI description of this API.
+          content:
+            application/yaml:
+              schema: { type: string }
+
+  /api/register:
+    post:
+      tags: [Customers]
+      summary: Open an account
+      operationId: register
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegisterRequest' }
+      responses:
+        '201':
+          description: The account was created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RegisterResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409':
+          description: That username is already taken.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+
+  /api/login:
+    post:
+      tags: [Customers]
+      summary: Sign in and get a bearer token
+      description: |
+        Three wrong passwords in a row lock the account for a while (423). Too many failed attempts from one
+        client address are refused (429). A successful login does not reset that client's count.
+      operationId: login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200':
+          description: Signed in.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LoginResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: Wrong username or password (the same answer for both).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '423': { $ref: '#/components/responses/Locked' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/logout:
+    post:
+      tags: [Customers]
+      summary: End this session
+      operationId: logout
+      security: [ { bearerAuth: [] } ]
+      responses:
+        '204': { description: The token no longer works. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/account:
+    get:
+      tags: [Customers]
+      summary: My account and balance
+      operationId: getAccount
+      security: [ { bearerAuth: [] } ]
+      responses:
+        '200':
+          description: The caller's account.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AccountResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/transactions:
+    get:
+      tags: [Customers]
+      summary: My transaction history, oldest first
+      operationId: listTransactions
+      security: [ { bearerAuth: [] } ]
+      responses:
+        '200':
+          description: Every successful deposit, withdrawal and transfer.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/TransactionResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/password:
+    post:
+      tags: [Customers]
+      summary: Change my password
+      description: |
+        A wrong current password counts as a failed login, so a stolen token cannot be used to guess it.
+        On success every other session of this user ends; the session that made the change stays signed in.
+      operationId: changePassword
+      security: [ { bearerAuth: [] } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ChangePasswordRequest' }
+      responses:
+        '204': { description: The password was changed. }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: The current password is wrong.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '423': { $ref: '#/components/responses/Locked' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/deposit:
+    post:
+      tags: [Money]
+      summary: Add money to my account
+      operationId: deposit
+      security: [ { bearerAuth: [] } ]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AmountRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/NewBalance' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /api/withdraw:
+    post:
+      tags: [Money]
+      summary: Take money out of my account
+      operationId: withdraw
+      security: [ { bearerAuth: [] } ]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AmountRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/NewBalance' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /api/transfer:
+    post:
+      tags: [Money]
+      summary: Send money to another account
+      description: 'All or nothing: if anything fails, neither balance changes.'
+      operationId: transfer
+      security: [ { bearerAuth: [] } ]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransferRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/NewBalance' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: There is no account with that number.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /api/admin/unlock:
+    post:
+      tags: [Admin]
+      summary: Unlock a locked user
+      description: Exists only when the server was started with an admin token; otherwise it answers 404.
+      operationId: adminUnlock
+      security: [ { adminToken: [] } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UnlockRequest' }
+      responses:
+        '204': { description: The user can sign in again (also returned if they were not locked). }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/AdminUnauthorized' }
+        '404':
+          description: No such user, or the admin API is switched off.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/admin/audit:
+    get:
+      tags: [Admin]
+      summary: Recent security events, newest first
+      description: Exists only when the server was started with an admin token; otherwise it answers 404.
+      operationId: adminAudit
+      security: [ { adminToken: [] } ]
+      parameters:
+        - name: username
+          in: query
+          required: false
+          description: Only events for this user.
+          schema: { type: string }
+        - name: limit
+          in: query
+          required: false
+          description: How many events to return (1 to 200).
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        '200':
+          description: The events.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/AuditEntryResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/AdminUnauthorized' }
+        '404':
+          description: The admin API is switched off.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: The token from `POST /api/login`.
+    adminToken:
+      type: apiKey
+      in: header
+      name: X-Admin-Token
+      description: The secret the server was started with (`--admin-token`).
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Makes the request safe to retry. 8 to 64 letters, numbers, hyphens or underscores (a UUID works well).
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 64
+        pattern: '^[A-Za-z0-9_-]+$'
+
+  headers:
+    RetryAfter:
+      description: Whole seconds to wait before trying again.
+      required: true
+      schema: { type: integer, minimum: 1 }
+    IdempotentReplayed:
+      description: '`true` if this is the stored answer to an earlier request with the same key.'
+      schema: { type: string, enum: ['true', 'false'] }
+
+  responses:
+    NewBalance:
+      description: Done. The caller's new balance.
+      headers:
+        Idempotent-Replayed:
+          $ref: '#/components/headers/IdempotentReplayed'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/BalanceResponse' }
+    BadRequest:
+      description: The request is invalid (wrong or missing fields, a bad amount, a bad header, ...).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    Unauthorized:
+      description: The token is missing, wrong, expired or was revoked.
+      headers:
+        WWW-Authenticate:
+          description: Always `Bearer`.
+          required: true
+          schema: { type: string, enum: [Bearer] }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    AdminUnauthorized:
+      description: The admin token is missing or wrong.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    PayloadTooLarge:
+      description: The request body is over 10 KB.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    UnsupportedMediaType:
+      description: The Content-Type must be application/json.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    Unprocessable:
+      description: |
+        The request was understood but cannot be done: not enough money, or the Idempotency-Key was already
+        used for a different request.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    Locked:
+      description: The account is locked after too many failed attempts.
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    TooManyRequests:
+      description: Too many failed attempts from this client address.
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  schemas:
+    RegisterRequest:
+      type: object
+      additionalProperties: false
+      required: [username, fullName, password]
+      properties:
+        username:
+          type: string
+          description: 3 to 20 letters, numbers or underscores. Not case-sensitive.
+        fullName: { type: string }
+        password:
+          type: string
+          description: At least 8 characters with a letter and a number, and not the same as the username.
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required: [username, password]
+      properties:
+        username: { type: string }
+        password: { type: string }
+    ChangePasswordRequest:
+      type: object
+      additionalProperties: false
+      required: [oldPassword, newPassword]
+      properties:
+        oldPassword: { type: string }
+        newPassword: { type: string }
+    AmountRequest:
+      type: object
+      additionalProperties: false
+      required: [amount]
+      properties:
+        amount: { $ref: '#/components/schemas/Amount' }
+    TransferRequest:
+      type: object
+      additionalProperties: false
+      required: [toAccountNumber, amount]
+      properties:
+        toAccountNumber: { type: string }
+        amount: { $ref: '#/components/schemas/Amount' }
+    UnlockRequest:
+      type: object
+      additionalProperties: false
+      required: [username]
+      properties:
+        username: { type: string }
+
+    Amount:
+      type: number
+      minimum: 0.01
+      maximum: 1000000000
+      description: Money, with at most 2 decimal places.
+      example: 100.5
+    Balance:
+      type: number
+      minimum: 0
+      description: Money, always with 2 decimal places on the wire.
+      example: 100.50
+
+    RegisterResponse:
+      type: object
+      additionalProperties: false
+      required: [username, fullName, accountNumber]
+      properties:
+        username: { type: string }
+        fullName: { type: string }
+        accountNumber: { type: string, pattern: '^[0-9]{10}$' }
+    LoginResponse:
+      type: object
+      additionalProperties: false
+      required: [token, tokenType, expiresInSeconds]
+      properties:
+        token: { type: string, pattern: '^[A-Za-z0-9_-]{43}$' }
+        tokenType: { type: string, enum: [Bearer] }
+        expiresInSeconds: { type: integer, minimum: 1 }
+    AccountResponse:
+      type: object
+      additionalProperties: false
+      required: [accountNumber, ownerName, balance]
+      properties:
+        accountNumber: { type: string, pattern: '^[0-9]{10}$' }
+        ownerName: { type: string }
+        balance: { $ref: '#/components/schemas/Balance' }
+    BalanceResponse:
+      type: object
+      additionalProperties: false
+      required: [balance]
+      properties:
+        balance: { $ref: '#/components/schemas/Balance' }
+    TransactionResponse:
+      type: object
+      additionalProperties: false
+      required: [type, amount, balanceAfter, timestamp]
+      properties:
+        type: { type: string, enum: [DEPOSIT, WITHDRAWAL, TRANSFER_OUT, TRANSFER_IN] }
+        amount: { $ref: '#/components/schemas/Amount' }
+        counterparty:
+          type: string
+          description: The other account, for transfers only.
+        balanceAfter: { $ref: '#/components/schemas/Balance' }
+        timestamp: { type: string, format: date-time }
+    AuditEntryResponse:
+      type: object
+      additionalProperties: false
+      required: [timestamp, type]
+      properties:
+        timestamp: { type: string, format: date-time }
+        type:
+          type: string
+          enum: [REGISTERED, LOGIN_SUCCESS, LOGIN_FAILED, LOGIN_BLOCKED, ACCOUNT_LOCKED, ACCOUNT_UNLOCKED,
+                 PASSWORD_CHANGED, TRANSFER, REQUEST_REPLAYED]
+        username: { type: string }
+        detail: { type: string }
+    StatusResponse:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status: { type: string, enum: [UP] }
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error: { type: string }

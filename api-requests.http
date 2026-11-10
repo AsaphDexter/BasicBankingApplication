@@ -54,6 +54,19 @@ Content-Type: application/json
   "amount": 250.75
 }
 
+### Deposit with an Idempotency-Key. Run this twice: the second answer is identical and no money is added again.
+POST http://localhost:8080/api/deposit
+Authorization: Bearer {{token}}
+Idempotency-Key: 0b9c1f6e-6d52-4a43-9b7e-1f0f1e2d3c4b
+Content-Type: application/json
+
+{
+  "amount": 10
+}
+
+### The API's own OpenAPI description
+GET http://localhost:8080/api/openapi.yaml
+
 ### Withdraw
 POST http://localhost:8080/api/withdraw
 Authorization: Bearer {{token}}

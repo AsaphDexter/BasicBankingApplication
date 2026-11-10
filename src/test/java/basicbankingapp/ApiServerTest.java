@@ -722,4 +722,188 @@ class ApiServerTest {
             assertEquals(401, post("/api/login", null, obj("username", "ghost", "password", "Wrong1234")).status());
         }
     }
+
+    // ---------- safe retries over HTTP ----------
+
+    private Reply money(String path, String token, String key, String body) throws Exception {
+        Map<String, String> headers = new LinkedHashMap<>();
+        headers.put("Content-Type", "application/json");
+        headers.put("Authorization", "Bearer " + token);
+        if (key != null) {
+            headers.put("Idempotency-Key", key);
+        }
+        return send(base, "POST", path, headers, body);
+    }
+
+    @Test
+    void aRepeatedDepositWithTheSameKeyMovesMoneyOnce() throws Exception {
+        String token = registerAndLogin("alice");
+        Reply first = money("/api/deposit", token, "deposit-key-0001", "{\"amount\":25.5}");
+        Reply second = money("/api/deposit", token, "deposit-key-0001", "{\"amount\":25.5}");
+        assertEquals(200, first.status());
+        assertEquals(200, second.status());
+        assertEquals("false", first.header("Idempotent-Replayed"));
+        assertEquals("true", second.header("Idempotent-Replayed"));
+        assertEquals("{\"balance\":25.50}", first.body());
+        assertEquals(first.body(), second.body()); // exactly the same answer
+        assertEquals(1, get("/api/transactions", token).json().size());
+    }
+
+    @Test
+    void aRepeatedWithdrawAndTransferAlsoMoveMoneyOnce() throws Exception {
+        String alice = registerAndLogin("alice");
+        String bob = registerAndLogin("bob");
+        String bobNumber = get("/api/account", bob).json().get("accountNumber").asText();
+        money("/api/deposit", alice, null, "{\"amount\":100}");
+
+        for (int i = 0; i < 3; i++) {
+            assertEquals(200, money("/api/withdraw", alice, "withdraw-key-0001", "{\"amount\":10}").status());
+            assertEquals(200, money("/api/transfer", alice, "transfer-key-0001",
+                "{\"toAccountNumber\":\"" + bobNumber + "\",\"amount\":30}").status());
+        }
+        assertEquals(0, get("/api/account", alice).json().get("balance").decimalValue().compareTo(new BigDecimal("60")));
+        assertEquals(0, get("/api/account", bob).json().get("balance").decimalValue().compareTo(new BigDecimal("30")));
+    }
+
+    @Test
+    void theSameAmountWrittenDifferentlyIsTheSameRequest() throws Exception {
+        String token = registerAndLogin("alice");
+        assertEquals("false", money("/api/deposit", token, "format-key-0001", "{\"amount\":10}").header("Idempotent-Replayed"));
+        assertEquals("true", money("/api/deposit", token, "format-key-0001", "{\"amount\":10.00}").header("Idempotent-Replayed"));
+        assertEquals("true", money("/api/deposit", token, "format-key-0001", "{\"amount\":1e1}").header("Idempotent-Replayed"));
+        assertEquals(0, get("/api/account", token).json().get("balance").decimalValue().compareTo(BigDecimal.TEN));
+    }
+
+    @Test
+    void reusingAKeyForADifferentRequestIs422AndChangesNothing() throws Exception {
+        String alice = registerAndLogin("alice");
+        String bob = registerAndLogin("bob");
+        String bobNumber = get("/api/account", bob).json().get("accountNumber").asText();
+        assertEquals(200, money("/api/deposit", alice, "reuse-key-00001", "{\"amount\":10}").status());
+
+        assertEquals(422, money("/api/deposit", alice, "reuse-key-00001", "{\"amount\":11}").status());      // other amount
+        assertEquals(422, money("/api/withdraw", alice, "reuse-key-00001", "{\"amount\":10}").status());     // other endpoint
+        assertEquals(422, money("/api/transfer", alice, "reuse-key-00001",
+            "{\"toAccountNumber\":\"" + bobNumber + "\",\"amount\":10}").status());                      // other endpoint again
+        assertEquals(0, get("/api/account", alice).json().get("balance").decimalValue().compareTo(BigDecimal.TEN));
+    }
+
+    @Test
+    void aTransferKeyReusedForAnotherRecipientIs422() throws Exception {
+        String alice = registerAndLogin("alice");
+        String bob = registerAndLogin("bob");
+        String carol = registerAndLogin("carol");
+        String bobNumber = get("/api/account", bob).json().get("accountNumber").asText();
+        String carolNumber = get("/api/account", carol).json().get("accountNumber").asText();
+        money("/api/deposit", alice, null, "{\"amount\":100}");
+        assertEquals(200, money("/api/transfer", alice, "recipient-key-01",
+            "{\"toAccountNumber\":\"" + bobNumber + "\",\"amount\":5}").status());
+        assertEquals(422, money("/api/transfer", alice, "recipient-key-01",
+            "{\"toAccountNumber\":\"" + carolNumber + "\",\"amount\":5}").status());
+        assertEquals(0, get("/api/account", carol).json().get("balance").decimalValue().compareTo(BigDecimal.ZERO));
+    }
+
+    @Test
+    void differentUsersCanUseTheSameKey() throws Exception {
+        String alice = registerAndLogin("alice");
+        String bob = registerAndLogin("bob");
+        assertEquals("false", money("/api/deposit", alice, "shared-key-0001", "{\"amount\":10}").header("Idempotent-Replayed"));
+        assertEquals("false", money("/api/deposit", bob, "shared-key-0001", "{\"amount\":20}").header("Idempotent-Replayed"));
+        assertEquals(0, get("/api/account", bob).json().get("balance").decimalValue().compareTo(new BigDecimal("20")));
+    }
+
+    @Test
+    void aFailedRequestDoesNotUseUpTheKey() throws Exception {
+        String token = registerAndLogin("alice");
+        assertEquals(422, money("/api/withdraw", token, "failed-key-0001", "{\"amount\":50}").status()); // no money yet
+        money("/api/deposit", token, null, "{\"amount\":100}");
+        Reply retry = money("/api/withdraw", token, "failed-key-0001", "{\"amount\":50}");
+        assertEquals(200, retry.status());
+        assertEquals("false", retry.header("Idempotent-Replayed")); // it really ran this time
+        assertEquals(0, get("/api/account", token).json().get("balance").decimalValue().compareTo(new BigDecimal("50")));
+    }
+
+    @Test
+    void aRejectedBodyDoesNotUseUpTheKeyEither() throws Exception {
+        String token = registerAndLogin("alice");
+        assertEquals(400, money("/api/deposit", token, "badbody-key-001", "{\"amount\":-5}").status());
+        assertEquals(400, money("/api/deposit", token, "badbody-key-001", "{broken").status());
+        assertEquals(200, money("/api/deposit", token, "badbody-key-001", "{\"amount\":5}").status());
+    }
+
+    @Test
+    void badIdempotencyKeyHeadersAre400() throws Exception {
+        String token = registerAndLogin("alice");
+        for (String bad : List.of("short", "has spaces here", "bad!characters", "x".repeat(65), " ")) {
+            assertEquals(400, money("/api/deposit", token, bad, "{\"amount\":5}").status(), bad);
+        }
+        // the header sent twice is ambiguous
+        HttpRequest twice = HttpRequest.newBuilder(URI.create(base + "/api/deposit"))
+            .header("Content-Type", "application/json").header("Authorization", "Bearer " + token)
+            .header("Idempotency-Key", "twice-key-00001").header("Idempotency-Key", "twice-key-00002")
+            .POST(HttpRequest.BodyPublishers.ofString("{\"amount\":5}")).build();
+        assertEquals(400, client.send(twice, HttpResponse.BodyHandlers.ofString()).statusCode());
+        assertEquals(0, get("/api/account", token).json().get("balance").decimalValue().compareTo(BigDecimal.ZERO));
+    }
+
+    @Test
+    void withoutAKeyNothingChanges() throws Exception {
+        String token = registerAndLogin("alice");
+        Reply first = money("/api/deposit", token, null, "{\"amount\":5}");
+        Reply second = money("/api/deposit", token, null, "{\"amount\":5}");
+        assertNull(first.header("Idempotent-Replayed"));
+        assertEquals(0, get("/api/account", token).json().get("balance").decimalValue().compareTo(BigDecimal.TEN));
+        assertEquals(first.body().replace("5.00", "10.00"), second.body());
+    }
+
+    @Test
+    void parallelRepeatsOfOneRequestMoveMoneyOnce() throws Exception {
+        String token = registerAndLogin("alice");
+        ExecutorService pool = Executors.newFixedThreadPool(10);
+        try {
+            List<Future<Reply>> results = new ArrayList<>();
+            for (int i = 0; i < 20; i++) {
+                results.add(pool.submit((Callable<Reply>) () -> money("/api/deposit", token, "parallel-key-001", "{\"amount\":3}")));
+            }
+            int fresh = 0;
+            for (Future<Reply> result : results) {
+                Reply reply = result.get();
+                assertEquals(200, reply.status());
+                assertEquals("{\"balance\":3.00}", reply.body());
+                if ("false".equals(reply.header("Idempotent-Replayed"))) {
+                    fresh++;
+                }
+            }
+            assertEquals(1, fresh);
+        } finally {
+            pool.shutdownNow();
+        }
+        assertEquals(0, get("/api/account", token).json().get("balance").decimalValue().compareTo(new BigDecimal("3")));
+    }
+
+    // ---------- OpenAPI document and timestamps ----------
+
+    @Test
+    void theApiPublishesItsOwnOpenApiDescription() throws Exception {
+        Reply reply = get("/api/openapi.yaml", null);
+        assertEquals(200, reply.status());
+        assertTrue(reply.header("Content-Type").startsWith("application/yaml"));
+        assertTrue(reply.body().startsWith("openapi: 3.0.3"));
+        for (String path : List.of("/api/health", "/api/register", "/api/login", "/api/logout", "/api/account",
+            "/api/transactions", "/api/deposit", "/api/withdraw", "/api/transfer", "/api/password",
+            "/api/admin/unlock", "/api/admin/audit", "/api/openapi.yaml")) {
+            assertTrue(reply.body().contains("  " + path + ":"), path + " is missing from the OpenAPI document");
+        }
+        assertEquals(405, post("/api/openapi.yaml", null, "{}").status());
+    }
+
+    @Test
+    void transactionTimestampsAreUtcIsoWithAZone() throws Exception {
+        String token = registerAndLogin("alice");
+        money("/api/deposit", token, null, "{\"amount\":5}");
+        String timestamp = get("/api/transactions", token).json().get(0).get("timestamp").asText();
+        assertTrue(timestamp.endsWith("Z"), timestamp);
+        java.time.Instant parsed = java.time.Instant.parse(timestamp); // throws if it is not a valid ISO instant
+        assertTrue(Math.abs(java.time.Duration.between(parsed, java.time.Instant.now()).toSeconds()) < 60);
+    }
 }

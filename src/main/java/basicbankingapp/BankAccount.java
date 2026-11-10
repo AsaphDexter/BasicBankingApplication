@@ -3,6 +3,7 @@ package basicbankingapp;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.LocalDateTime;
+import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -120,6 +121,6 @@ public class BankAccount {
     }
 
     private void record(Transaction.Type type, BigDecimal amount, String counterparty) {
-        history.add(new Transaction(type, amount, balance, LocalDateTime.now().truncatedTo(ChronoUnit.MICROS), counterparty));
+        history.add(new Transaction(type, amount, balance, LocalDateTime.now(ZoneOffset.UTC).truncatedTo(ChronoUnit.MICROS), counterparty));
     }
 }

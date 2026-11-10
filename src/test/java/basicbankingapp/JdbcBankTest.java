@@ -174,6 +174,76 @@ class JdbcBankTest extends AbstractBankTest {
         }
     }
 
+    @Test
+    void aRetryAfterRestartingTheAppStillGetsTheStoredAnswer() throws IOException {
+        Path dir = Files.createTempDirectory("bba-test");
+        try {
+            Path dbFile = dir.resolve("bank");
+            String accountNumber;
+            try (JdbcBankRepository first = JdbcBankRepository.file(dbFile)) {
+                Bank bank1 = new Bank(FAST_HASHER, first, clock, LOCKOUT);
+                User alice = bank1.register("alice", "Alice Doe", pw("Passw0rd1"));
+                accountNumber = acct(alice);
+                bank1.executeOnce("alice", "retry-key-0001", "print", () -> {
+                    bank1.deposit(accountNumber, money("10"));
+                    return "{\"balance\":10.00}";
+                });
+            }
+            try (JdbcBankRepository second = JdbcBankRepository.file(dbFile)) {
+                Bank bank2 = new Bank(FAST_HASHER, second, clock, LOCKOUT);
+                Bank.OnceResult retry = bank2.executeOnce("alice", "retry-key-0001", "print", () -> {
+                    bank2.deposit(accountNumber, money("10"));
+                    return "should never run";
+                });
+                assertTrue(retry.replayed());
+                assertEquals("{\"balance\":10.00}", retry.result());
+                assertEquals(money("10.00"), bank2.findAccount(accountNumber).getBalance());
+            }
+        } finally {
+            deleteRecursively(dir);
+        }
+    }
+
+    @Test
+    void moneyAndTheIdempotencyRecordAreSavedTogetherOrNotAtAll() {
+        User alice = register("alice");
+        // The action moves money and then fails: the deposit must be undone and the key must stay free.
+        assertThrows(IllegalStateException.class, () -> bank.executeOnce("alice", "retry-key-0001", "print", () -> {
+            bank.deposit(acct(alice), money("50"));
+            throw new IllegalStateException("simulated crash after the money moved");
+        }));
+        assertEquals(0, balanceOf(alice).compareTo(BigDecimal.ZERO));
+        assertTrue(stored(alice).getHistory().isEmpty());
+        assertFalse(repository.findIdempotencyRecord("alice", "retry-key-0001").isPresent());
+
+        Bank.OnceResult retry = bank.executeOnce("alice", "retry-key-0001", "print", () -> {
+            bank.deposit(acct(alice), money("50"));
+            return "ok";
+        });
+        assertFalse(retry.replayed());
+        assertEquals(money("50.00"), balanceOf(alice));
+    }
+
+    @Test
+    void expiredRecordsAreCleanedOutOfTheDatabase() {
+        register("alice");
+        bank.executeOnce("alice", "retry-key-0001", "print", () -> "first");
+        clock.advance(Bank.IDEMPOTENCY_TTL.plusSeconds(1));
+        bank.executeOnce("alice", "retry-key-0002", "print", () -> "second"); // storing this clears the expired one
+        assertFalse(repository.findIdempotencyRecord("alice", "retry-key-0001").isPresent());
+        assertTrue(repository.findIdempotencyRecord("alice", "retry-key-0002").isPresent());
+    }
+
+    @Test
+    void theDatabaseKeepsOneRecordPerUserAndKey() throws SQLException {
+        register("alice");
+        bank.executeOnce("alice", "retry-key-0001", "print", () -> "x");
+        try (Connection c = rawConnection();
+             PreparedStatement ps = c.prepareStatement("INSERT INTO idempotency_keys VALUES ('alice', 'retry-key-0001', 'p', 'r', CURRENT_TIMESTAMP)")) {
+            assertThrows(SQLException.class, ps::executeUpdate);
+        }
+    }
+
     // ---------- all-or-nothing transfers ----------
 
     @Test
@@ -330,6 +400,21 @@ class JdbcBankTest extends AbstractBankTest {
         @Override
         public List<AuditEvent> recentAudit(String username, int limit) {
             return delegate.recentAudit(username, limit);
+        }
+
+        @Override
+        public Optional<IdempotencyRecord> findIdempotencyRecord(String username, String key) {
+            return delegate.findIdempotencyRecord(username, key);
+        }
+
+        @Override
+        public void saveIdempotencyRecord(IdempotencyRecord record) {
+            delegate.saveIdempotencyRecord(record);
+        }
+
+        @Override
+        public void deleteIdempotencyRecordsBefore(java.time.Instant cutoff) {
+            delegate.deleteIdempotencyRecordsBefore(cutoff);
         }
 
         @Override

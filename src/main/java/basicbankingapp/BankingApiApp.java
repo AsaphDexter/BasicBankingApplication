@@ -8,9 +8,10 @@ import java.time.Clock;
 import java.time.Duration;
 
 /**
- * Starts the REST API. Options:
+ * Starts the REST API. Options (see {@link ApiOptions}):
  * <pre>
- * --port 8080               port to listen on (localhost only)
+ * --host localhost          address to listen on; 0.0.0.0 for all interfaces (needed inside a container)
+ * --port 8080               port to listen on
  * --memory                  throwaway data instead of the saved database
  * --admin-token SECRET      switches on the admin endpoints (or set BANKING_ADMIN_TOKEN); 16+ characters
  * --lockout-seconds 900     how long an account stays locked after 3 failed logins
@@ -24,48 +25,22 @@ public final class BankingApiApp {
     private BankingApiApp() { }
 
     public static void main(String[] args) throws IOException {
-        int port = 8080;
-        boolean memoryOnly = false;
-        String adminToken = System.getenv("BANKING_ADMIN_TOKEN");
-        long lockoutSeconds = Bank.DEFAULT_LOCKOUT.toSeconds();
-        int failureLimit = 20;
-        long windowSeconds = 300;
-
+        ApiOptions options;
         try {
-            for (int i = 0; i < args.length; i++) {
-                switch (args[i]) {
-                    case "--memory" -> memoryOnly = true;
-                    case "--port" -> port = Integer.parseInt(args[++i]);
-                    case "--admin-token" -> adminToken = args[++i];
-                    case "--lockout-seconds" -> lockoutSeconds = Long.parseLong(args[++i]);
-                    case "--login-failure-limit" -> failureLimit = Integer.parseInt(args[++i]);
-                    case "--login-window-seconds" -> windowSeconds = Long.parseLong(args[++i]);
-                    default -> {
-                        usage();
-                        return;
-                    }
-                }
-            }
-            if (adminToken != null && adminToken.length() < 16) {
-                System.out.println("The admin token must be at least 16 characters.");
-                return;
-            }
-            if (lockoutSeconds < 1 || windowSeconds < 1 || failureLimit < 0) {
-                usage();
-                return;
-            }
-        } catch (NumberFormatException | ArrayIndexOutOfBoundsException e) {
-            usage();
+            options = ApiOptions.parse(args, System.getenv());
+        } catch (IllegalArgumentException e) {
+            System.out.println(e.getMessage());
             return;
         }
 
-        BankRepository repository = memoryOnly
+        BankRepository repository = options.memoryOnly()
             ? new InMemoryBankRepository()
             : JdbcBankRepository.file(Path.of("data", "bank"));
-        Bank bank = new Bank(new PasswordHasher(), repository, Clock.systemUTC(), Duration.ofSeconds(lockoutSeconds));
+        Bank bank = new Bank(new PasswordHasher(), repository, Clock.systemUTC(),
+            Duration.ofSeconds(options.lockoutSeconds()));
         ApiServer server = new ApiServer(bank, new SessionStore(Duration.ofMinutes(30)),
-            new LoginThrottle(failureLimit, Duration.ofSeconds(windowSeconds)), adminToken,
-            new InetSocketAddress(InetAddress.getLoopbackAddress(), port));
+            new LoginThrottle(options.failureLimit(), Duration.ofSeconds(options.windowSeconds())),
+            options.adminToken(), new InetSocketAddress(InetAddress.getByName(options.host()), options.port()));
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             server.close();
@@ -73,18 +48,17 @@ public final class BankingApiApp {
         }));
 
         server.start();
-        System.out.println("Banking API listening on http://localhost:" + server.port()
-            + (memoryOnly ? " (demo mode: nothing is saved)" : " (data saved in the data folder)"));
-        System.out.println("Accounts lock for " + lockoutSeconds + " s after " + Bank.MAX_FAILED_LOGINS
-            + " failed logins; " + (failureLimit == 0 ? "no per-client login limit"
-            : failureLimit + " failed logins per client per " + windowSeconds + " s"));
-        System.out.println(adminToken == null ? "Admin endpoints are switched off (no admin token set)."
+        System.out.println("Banking API listening on http://" + options.host() + ":" + server.port()
+            + (options.memoryOnly() ? " (demo mode: nothing is saved)" : " (data saved in the data folder)"));
+        if (options.listensOnAllInterfaces()) {
+            System.out.println("WARNING: listening on all network interfaces over plain HTTP. "
+                + "Put HTTPS in front of it, or publish the port to localhost only.");
+        }
+        System.out.println("Accounts lock for " + options.lockoutSeconds() + " s after " + Bank.MAX_FAILED_LOGINS
+            + " failed logins; " + (options.failureLimit() == 0 ? "no per-client login limit"
+            : options.failureLimit() + " failed logins per client per " + options.windowSeconds() + " s"));
+        System.out.println(options.adminToken() == null ? "Admin endpoints are switched off (no admin token set)."
             : "Admin endpoints are on.");
         System.out.println("Press Ctrl+C to stop.");
-    }
-
-    private static void usage() {
-        System.out.println("Usage: BankingApiApp [--port N] [--memory] [--admin-token SECRET] "
-            + "[--lockout-seconds N] [--login-failure-limit N] [--login-window-seconds N]");
     }
 }

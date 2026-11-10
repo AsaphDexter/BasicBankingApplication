@@ -1,0 +1,21 @@
+# Runs the banking API in a container:   docker compose up --build
+# The API is then at http://localhost:8080 (only reachable from this machine) and its data is kept in a volume.
+#   docker compose down        stop it (the data stays)
+#   docker compose down -v     stop it and delete the data
+# To switch on the admin endpoints:   BANKING_ADMIN_TOKEN=a-secret-of-16-or-more-chars docker compose up --build
+name: banking-api
+
+services:
+  api:
+    build: .
+    image: basic-banking-api
+    ports:
+      - "127.0.0.1:8080:8080"     # localhost only: this is plain HTTP, so it must not face the network
+    environment:
+      BANKING_ADMIN_TOKEN: "${BANKING_ADMIN_TOKEN:-}"
+    volumes:
+      - bank-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  bank-data:

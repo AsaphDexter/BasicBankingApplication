@@ -6,6 +6,8 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Optional;
+import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
 /**
@@ -20,6 +22,9 @@ public class Bank {
 
     public static final int MAX_FAILED_LOGINS = 3;
     public static final Duration DEFAULT_LOCKOUT = Duration.ofMinutes(15);
+    /** How long a client may safely retry a request with the same idempotency key. */
+    public static final Duration IDEMPOTENCY_TTL = Duration.ofHours(24);
+    private static final Pattern IDEMPOTENCY_KEY = Pattern.compile("[A-Za-z0-9_-]{8,64}");
     private static final Pattern USERNAME = Pattern.compile("[A-Za-z0-9_]{3,20}");
     private static final String BAD_LOGIN = "Invalid username or password";
     private static final String BAD_OLD_PASSWORD = "Current password is incorrect";
@@ -287,6 +292,51 @@ public class Bank {
                 save(to);
                 audit(AuditEvent.Type.TRANSFER, actingUsername == null ? null : normalize(actingUsername), "from " + from.getCustomerId() + " to "
                     + to.getCustomerId() + " amount " + amount.setScale(2, java.math.RoundingMode.UNNECESSARY));
+            });
+        }
+    }
+
+    // ---------- safe retries ----------
+
+    /** The answer to a request, and whether it is a repeat of an earlier answer. */
+    public record OnceResult(String result, boolean replayed) { }
+
+    /**
+     * Runs {@code action} at most once per (user, key). If the same user sends the same key and the same
+     * request again, the stored answer is returned and nothing is repeated. If the key comes back with a
+     * different request, {@link IdempotencyKeyReusedException} is thrown. A repeat that arrives while the
+     * first is still running waits for it (everything is serialized by one lock) and then gets the stored answer.
+     *
+     * The action and the stored answer are saved in ONE transaction, so a crash can never leave money moved
+     * without a record of it. If the action fails nothing is stored and the key can be used again.
+     * Records expire after {@link #IDEMPOTENCY_TTL}.
+     *
+     * @param fingerprint a fixed-size summary of the request (for example a SHA-256 hex string)
+     */
+    public OnceResult executeOnce(String username, String key, String fingerprint, Supplier<String> action) {
+        if (key == null || !IDEMPOTENCY_KEY.matcher(key).matches()) {
+            throw new IllegalArgumentException("The idempotency key must be 8 to 64 letters, numbers, hyphens or underscores");
+        }
+        if (fingerprint == null || fingerprint.isEmpty() || fingerprint.length() > 64) {
+            throw new IllegalArgumentException("The request fingerprint must be 1 to 64 characters");
+        }
+        String owner = normalize(username);
+        synchronized (lock) {
+            return repository.inTransaction(() -> {
+                Instant now = clock.instant();
+                Optional<IdempotencyRecord> earlier = repository.findIdempotencyRecord(owner, key)
+                    .filter(record -> record.createdAt().plus(IDEMPOTENCY_TTL).isAfter(now));
+                if (earlier.isPresent()) {
+                    if (!earlier.get().fingerprint().equals(fingerprint)) {
+                        throw new IdempotencyKeyReusedException();
+                    }
+                    audit(AuditEvent.Type.REQUEST_REPLAYED, owner, "key " + key);
+                    return new OnceResult(earlier.get().result(), true);
+                }
+                String result = action.get();
+                repository.deleteIdempotencyRecordsBefore(now.minus(IDEMPOTENCY_TTL)); // also clears an expired copy of this key
+                repository.saveIdempotencyRecord(new IdempotencyRecord(owner, key, fingerprint, result, now));
+                return new OnceResult(result, false);
             });
         }
     }

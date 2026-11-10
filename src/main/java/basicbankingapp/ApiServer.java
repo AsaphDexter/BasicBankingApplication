@@ -27,15 +27,21 @@ import com.fasterxml.jackson.databind.type.LogicalType;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import java.io.IOException;
+import java.io.InputStream;
 import java.math.BigDecimal;
 import java.net.InetSocketAddress;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
+import java.util.HexFormat;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Supplier;
+import java.util.regex.Pattern;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -54,9 +60,13 @@ import java.util.concurrent.Executors;
  * POST /api/withdraw      {amount}                       (needs token)
  * POST /api/transfer      {toAccountNumber, amount}      (needs token)
  * POST /api/password      {oldPassword, newPassword}     (needs token)
+ * GET  /api/openapi.yaml                                 the OpenAPI description of this API
  * POST /api/admin/unlock  {username}                     (needs the admin token)
  * GET  /api/admin/audit?username=&limit=                 (needs the admin token)
  * </pre>
+ *
+ * deposit, withdraw and transfer accept an optional {@code Idempotency-Key} header: sending the same key and
+ * the same request again returns the first answer instead of moving the money twice.
  *
  * Every protected endpoint acts only on the account of the token's owner, so there is no
  * account-number parameter that could be changed to reach someone else's data.
@@ -66,6 +76,7 @@ public final class ApiServer implements AutoCloseable {
 
     private static final int MAX_BODY_BYTES = 10_000;
     private static final String BEARER = "Bearer ";
+    private static final Pattern IDEMPOTENCY_KEY = Pattern.compile("[A-Za-z0-9_-]{8,64}");
 
     private static final ObjectMapper JSON = JsonMapper.builder()
         .enable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
@@ -84,6 +95,7 @@ public final class ApiServer implements AutoCloseable {
     private final LoginThrottle throttle;
     private final String adminToken; // null: the admin endpoints do not exist
     private final HttpServer server;
+    private final byte[] openApiDocument; // null if the spec is not on the classpath
     private final ExecutorService executor = Executors.newFixedThreadPool(8);
 
     /** No throttling and no admin endpoints. */
@@ -103,6 +115,7 @@ public final class ApiServer implements AutoCloseable {
         this.sessions = sessions;
         this.throttle = throttle;
         this.adminToken = adminToken;
+        this.openApiDocument = loadOpenApiDocument();
         this.server = HttpServer.create(address, 0);
         this.server.createContext("/", this::handle);
         this.server.setExecutor(executor);
@@ -181,6 +194,10 @@ public final class ApiServer implements AutoCloseable {
                 requireMethod(ex, "POST");
                 transfer(ex);
             }
+            case "/api/openapi.yaml" -> {
+                requireMethod(ex, "GET");
+                openApi(ex);
+            }
             case "/api/password" -> {
                 requireMethod(ex, "POST");
                 changePassword(ex);
@@ -246,32 +263,72 @@ public final class ApiServer implements AutoCloseable {
         User user = authenticate(ex);
         List<TransactionResponse> history = bank.findAccount(accountNumber(user)).getHistory().stream()
             .map(t -> new TransactionResponse(t.type().name(), t.amount(), t.counterparty(),
-                t.balanceAfter(), t.timestamp().toString()))
+                t.balanceAfter(),
+                DateTimeFormatter.ISO_INSTANT.format(t.timestamp().toInstant(ZoneOffset.UTC))))
             .toList();
         send(ex, 200, history);
     }
 
     private void deposit(HttpExchange ex) throws IOException {
         User user = authenticate(ex);
+        String key = idempotencyKey(ex);
         BigDecimal amount = requireAmount(readJson(ex, AmountRequest.class).amount());
-        perform(() -> bank.deposit(accountNumber(user), amount));
-        send(ex, 200, new BalanceResponse(bank.findAccount(accountNumber(user)).getBalance()));
+        moneyOperation(ex, user, key, fingerprint("/api/deposit", canonical(amount)),
+            () -> bank.deposit(accountNumber(user), amount));
     }
 
     private void withdraw(HttpExchange ex) throws IOException {
         User user = authenticate(ex);
+        String key = idempotencyKey(ex);
         BigDecimal amount = requireAmount(readJson(ex, AmountRequest.class).amount());
-        perform(() -> bank.withdraw(accountNumber(user), amount));
-        send(ex, 200, new BalanceResponse(bank.findAccount(accountNumber(user)).getBalance()));
+        moneyOperation(ex, user, key, fingerprint("/api/withdraw", canonical(amount)),
+            () -> bank.withdraw(accountNumber(user), amount));
     }
 
     private void transfer(HttpExchange ex) throws IOException {
         User user = authenticate(ex);
+        String key = idempotencyKey(ex);
         TransferRequest request = readJson(ex, TransferRequest.class);
         require(request.toAccountNumber(), "toAccountNumber");
         BigDecimal amount = requireAmount(request.amount());
-        perform(() -> bank.transfer(accountNumber(user), request.toAccountNumber().trim(), amount, user.getUsername()));
-        send(ex, 200, new BalanceResponse(bank.findAccount(accountNumber(user)).getBalance()));
+        String recipient = request.toAccountNumber().trim();
+        moneyOperation(ex, user, key, fingerprint("/api/transfer", recipient, canonical(amount)),
+            () -> bank.transfer(accountNumber(user), recipient, amount, user.getUsername()));
+    }
+
+    /**
+     * Runs a money-moving request and answers with the caller's new balance. With an Idempotency-Key the
+     * request runs at most once: a repeat gets the first answer back (header Idempotent-Replayed: true).
+     */
+    private void moneyOperation(HttpExchange ex, User user, String key, String fingerprint, Runnable operation)
+        throws IOException {
+        String account = accountNumber(user);
+        Supplier<String> action = () -> {
+            perform(operation);
+            return toJson(new BalanceResponse(bank.findAccount(account).getBalance()));
+        };
+        if (key == null) {
+            sendJson(ex, 200, action.get());
+            return;
+        }
+        Bank.OnceResult outcome;
+        try {
+            outcome = bank.executeOnce(user.getUsername(), key, fingerprint, action);
+        } catch (IdempotencyKeyReusedException e) {
+            throw new ApiException(422, e.getMessage());
+        }
+        ex.getResponseHeaders().set("Idempotent-Replayed", String.valueOf(outcome.replayed()));
+        sendJson(ex, 200, outcome.result());
+    }
+
+    private void openApi(HttpExchange ex) throws IOException {
+        if (openApiDocument == null) {
+            throw new ApiException(404, "Not found");
+        }
+        addCommonHeaders(ex);
+        ex.getResponseHeaders().set("Content-Type", "application/yaml; charset=utf-8");
+        ex.sendResponseHeaders(200, openApiDocument.length);
+        ex.getResponseBody().write(openApiDocument);
     }
 
     private void changePassword(HttpExchange ex) throws IOException {
@@ -389,6 +446,50 @@ public final class ApiServer implements AutoCloseable {
         return parameters;
     }
 
+    /** The Idempotency-Key header, or null if there is none. A bad or repeated header is a 400. */
+    private static String idempotencyKey(HttpExchange ex) {
+        List<String> values = ex.getRequestHeaders().get("Idempotency-Key");
+        if (values == null) {
+            return null;
+        }
+        if (values.size() != 1 || !IDEMPOTENCY_KEY.matcher(values.get(0).trim()).matches()) {
+            throw new ApiException(400, "Idempotency-Key must be 8 to 64 letters, numbers, hyphens or underscores, sent once");
+        }
+        return values.get(0).trim();
+    }
+
+    /** The same amount written differently (10, 10.00, 1e1) gives the same text. Cheap even for 1e999999999. */
+    private static String canonical(BigDecimal amount) {
+        return amount.stripTrailingZeros().toString();
+    }
+
+    /** A fixed-size summary of a request, used to notice a key being reused for something else. */
+    private static String fingerprint(String... parts) {
+        try {
+            MessageDigest sha = MessageDigest.getInstance("SHA-256");
+            return HexFormat.of().formatHex(sha.digest(String.join("\n", parts).getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    private static String toJson(Object body) {
+        try {
+            return JSON.writeValueAsString(body);
+        } catch (IOException e) { // in practice a JsonProcessingException
+
+            throw new IllegalStateException(e);
+        }
+    }
+
+    private static byte[] loadOpenApiDocument() {
+        try (InputStream in = ApiServer.class.getResourceAsStream("/openapi.yaml")) {
+            return in == null ? null : in.readAllBytes();
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
     private static String accountNumber(User user) {
         return user.getAccount().getCustomerId();
     }
@@ -466,6 +567,15 @@ public final class ApiServer implements AutoCloseable {
 
     private static void send(HttpExchange ex, int status, Object body) throws IOException {
         byte[] bytes = JSON.writeValueAsBytes(body);
+        addCommonHeaders(ex);
+        ex.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
+        ex.sendResponseHeaders(status, bytes.length);
+        ex.getResponseBody().write(bytes);
+    }
+
+    /** Sends JSON that is already text (a stored answer being replayed, or one built for storing). */
+    private static void sendJson(HttpExchange ex, int status, String json) throws IOException {
+        byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
         addCommonHeaders(ex);
         ex.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
         ex.sendResponseHeaders(status, bytes.length);

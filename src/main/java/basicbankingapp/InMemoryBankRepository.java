@@ -48,6 +48,7 @@ public class InMemoryBankRepository implements BankRepository {
     private final Map<String, StoredUser> users = new HashMap<>();
     private final Map<String, StoredAccount> accounts = new HashMap<>();
     private final List<AuditEvent> audit = new ArrayList<>();
+    private final Map<String, IdempotencyRecord> idempotency = new HashMap<>();
     private long nextAccountNumber = 1_000_000_001L;
 
     @Override
@@ -134,6 +135,21 @@ public class InMemoryBankRepository implements BankRepository {
             }
         }
         return result;
+    }
+
+    @Override
+    public synchronized Optional<IdempotencyRecord> findIdempotencyRecord(String username, String key) {
+        return Optional.ofNullable(idempotency.get(username + "\u0000" + key));
+    }
+
+    @Override
+    public synchronized void saveIdempotencyRecord(IdempotencyRecord record) {
+        idempotency.put(record.username() + "\u0000" + record.key(), record);
+    }
+
+    @Override
+    public synchronized void deleteIdempotencyRecordsBefore(Instant cutoff) {
+        idempotency.values().removeIf(record -> !record.createdAt().isAfter(cutoff));
     }
 
     @Override

@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import java.math.BigDecimal;
 import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -624,5 +625,137 @@ abstract class AbstractBankTest {
         assertEquals(3, bank.auditLog("alice", 3).size());
         assertEquals(AuditEvent.Type.LOGIN_SUCCESS, bank.auditLog("alice", 3).get(0).type());
         assertEquals(AuditEvent.Type.REGISTERED, bank.auditLog("alice", 100).get(5).type());
+    }
+
+    // ---------- safe retries (idempotency) ----------
+
+    private static final String KEY = "retry-key-0001";
+    private static final String PRINT = "fingerprint-of-the-request";
+
+    @Test
+    void firstUseRunsTheActionAndAnIdenticalRepeatGetsTheStoredAnswer() {
+        register("alice");
+        AtomicInteger runs = new AtomicInteger();
+        Bank.OnceResult first = bank.executeOnce("alice", KEY, PRINT, () -> "answer-" + runs.incrementAndGet());
+        Bank.OnceResult repeat = bank.executeOnce("alice", KEY, PRINT, () -> "answer-" + runs.incrementAndGet());
+        assertEquals("answer-1", first.result());
+        assertFalse(first.replayed());
+        assertEquals("answer-1", repeat.result());
+        assertTrue(repeat.replayed());
+        assertEquals(1, runs.get());
+    }
+
+    @Test
+    void aRepeatMovesTheMoneyOnlyOnce() {
+        User alice = register("alice");
+        for (int i = 0; i < 5; i++) {
+            bank.executeOnce("alice", KEY, PRINT, () -> {
+                bank.deposit(acct(alice), money("10"));
+                return "ok";
+            });
+        }
+        assertEquals(money("10.00"), balanceOf(alice));
+        assertEquals(1, stored(alice).getHistory().size());
+    }
+
+    @Test
+    void theSameKeyWithADifferentRequestIsRefusedAndRunsNothing() {
+        register("alice");
+        AtomicInteger runs = new AtomicInteger();
+        bank.executeOnce("alice", KEY, PRINT, () -> "x" + runs.incrementAndGet());
+        assertThrows(IdempotencyKeyReusedException.class,
+            () -> bank.executeOnce("alice", KEY, "a-different-request", () -> "x" + runs.incrementAndGet()));
+        assertEquals(1, runs.get());
+    }
+
+    @Test
+    void keysBelongToTheUserWhoUsedThem() {
+        register("alice");
+        register("bob");
+        bank.executeOnce("alice", KEY, PRINT, () -> "alice-answer");
+        Bank.OnceResult bobs = bank.executeOnce("bob", KEY, "bobs-request", () -> "bob-answer");
+        assertFalse(bobs.replayed());
+        assertEquals("bob-answer", bobs.result());
+        assertEquals("alice-answer", bank.executeOnce("alice", KEY, PRINT, () -> "never").result());
+    }
+
+    @Test
+    void aFailedActionStoresNothingSoTheKeyCanBeUsedAgain() {
+        User alice = register("alice");
+        assertThrows(InsufficientFundsException.class, () -> bank.executeOnce("alice", KEY, PRINT, () -> {
+            bank.withdraw(acct(alice), money("5"));
+            return "ok";
+        }));
+        bank.deposit(acct(alice), money("20"));
+        Bank.OnceResult retry = bank.executeOnce("alice", KEY, PRINT, () -> {
+            bank.withdraw(acct(alice), money("5"));
+            return "ok";
+        });
+        assertFalse(retry.replayed());
+        assertEquals(money("15.00"), balanceOf(alice));
+    }
+
+    @Test
+    void recordsExpireAfter24HoursAndTheKeyWorksAgain() {
+        register("alice");
+        AtomicInteger runs = new AtomicInteger();
+        bank.executeOnce("alice", KEY, PRINT, () -> "run-" + runs.incrementAndGet());
+        clock.advance(Bank.IDEMPOTENCY_TTL.minusSeconds(1));
+        assertTrue(bank.executeOnce("alice", KEY, PRINT, () -> "never").replayed());
+        clock.advance(Duration.ofSeconds(1));
+        Bank.OnceResult afterExpiry = bank.executeOnce("alice", KEY, "a-new-request", () -> "run-" + runs.incrementAndGet());
+        assertFalse(afterExpiry.replayed());
+        assertEquals("run-2", afterExpiry.result());
+    }
+
+    @Test
+    void invalidKeysAndFingerprintsAreRejected() {
+        register("alice");
+        for (String bad : new String[] {null, "", "short", "has spaces in it", "bad!characters", "x".repeat(65)}) {
+            assertThrows(IllegalArgumentException.class, () -> bank.executeOnce("alice", bad, PRINT, () -> "x"));
+        }
+        assertThrows(IllegalArgumentException.class, () -> bank.executeOnce("alice", KEY, "", () -> "x"));
+        assertThrows(IllegalArgumentException.class, () -> bank.executeOnce("alice", KEY, "f".repeat(65), () -> "x"));
+        assertEquals(8, "12345678".length());
+        bank.executeOnce("alice", "12345678", PRINT, () -> "eight characters is the minimum");
+        bank.executeOnce("alice", "x".repeat(64), PRINT, () -> "64 is the maximum");
+    }
+
+    @Test
+    void parallelRepeatsRunTheActionExactlyOnce() throws Exception {
+        User alice = register("alice");
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(8);
+        try {
+            AtomicInteger runs = new AtomicInteger();
+            List<java.util.concurrent.Future<Bank.OnceResult>> results = new java.util.ArrayList<>();
+            for (int i = 0; i < 20; i++) {
+                results.add(pool.submit(() -> bank.executeOnce("alice", KEY, PRINT, () -> {
+                    runs.incrementAndGet();
+                    bank.deposit(acct(alice), money("1"));
+                    return "ok";
+                })));
+            }
+            int replays = 0;
+            for (java.util.concurrent.Future<Bank.OnceResult> result : results) {
+                if (result.get(30, java.util.concurrent.TimeUnit.SECONDS).replayed()) {
+                    replays++;
+                }
+            }
+            assertEquals(1, runs.get());
+            assertEquals(19, replays);
+            assertEquals(money("1.00"), balanceOf(alice));
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void replaysAreWrittenToTheAuditLog() {
+        register("alice");
+        bank.executeOnce("alice", KEY, PRINT, () -> "ok");
+        bank.executeOnce("alice", KEY, PRINT, () -> "ok");
+        var replays = bank.auditLog("alice", 50).stream().filter(e -> e.type() == AuditEvent.Type.REQUEST_REPLAYED).toList();
+        assertEquals(1, replays.size());
+        assertTrue(replays.get(0).detail().contains(KEY));
     }
 }

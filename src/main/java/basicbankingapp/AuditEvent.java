@@ -7,6 +7,6 @@ public record AuditEvent(Instant time, Type type, String username, String detail
 
     public enum Type {
         REGISTERED, LOGIN_SUCCESS, LOGIN_FAILED, LOGIN_BLOCKED,
-        ACCOUNT_LOCKED, ACCOUNT_UNLOCKED, PASSWORD_CHANGED, TRANSFER
+        ACCOUNT_LOCKED, ACCOUNT_UNLOCKED, PASSWORD_CHANGED, TRANSFER, REQUEST_REPLAYED
     }
 }

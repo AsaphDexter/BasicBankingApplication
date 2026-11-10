@@ -19,3 +19,26 @@ jobs:
           cache: maven
       - name: Build and run tests
         run: mvn -B verify
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image
+        run: docker build -t basic-banking-api .
+      - name: Start a container
+        run: docker run -d --name api -p 8080:8080 basic-banking-api --host 0.0.0.0 --port 8080 --memory
+      - name: Wait until the container reports healthy
+        run: |
+          for i in $(seq 1 30); do
+            status=$(docker inspect --format '{{.State.Health.Status}}' api)
+            echo "health: $status"
+            if [ "$status" = "healthy" ]; then exit 0; fi
+            sleep 2
+          done
+          docker logs api
+          exit 1
+      - name: Smoke test through the published port
+        run: |
+          curl -sf http://localhost:8080/api/health
+          curl -sf http://localhost:8080/api/openapi.yaml | head -3

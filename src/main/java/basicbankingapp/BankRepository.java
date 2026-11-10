@@ -1,5 +1,6 @@
 package basicbankingapp;
 
+import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 import java.util.function.Supplier;
@@ -45,6 +46,13 @@ public interface BankRepository extends AutoCloseable {
 
     /** Saves one money movement: the new balance (taken from the transaction) and the transaction itself. */
     void applyChange(String accountNumber, Transaction transaction);
+
+    Optional<IdempotencyRecord> findIdempotencyRecord(String username, String key);
+
+    void saveIdempotencyRecord(IdempotencyRecord record);
+
+    /** Removes records created at or before the cutoff. */
+    void deleteIdempotencyRecordsBefore(Instant cutoff);
 
     String nextAccountNumber();
 
